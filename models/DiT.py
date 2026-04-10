@@ -20,7 +20,7 @@ class RotaryPositionalEmbedding(nn.Module):
         inv_freq = 1.0 / (
             base ** (torch.arange(0, dim, 2, dtype=torch.int64).float() / dim)
         )
-        # Ignore copy
+
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self.cached_sequence_length = None
         self.cached_rotary_positional_embedding = None
@@ -108,7 +108,7 @@ class ROPEMHAAttention(nn.Module):
         )
 
         self.positional_embedding = ROPE(
-            hidden_size=hidden_size, num_attention_heads=num_attention_heads
+            hidden_size=hidden_size, num_attention_heads=num_heads
         )
 
     def forward(self, hidden_states: torch.Tensor):
@@ -155,10 +155,16 @@ class ROPEMHAAttention(nn.Module):
 
 
 class AdaLN(nn.Module):
-    def __init__(self, conditioning_size: int):
+    def __init__(self, conditioning_size: int, hidden_size=256):
         super().__init__()
-        self.silu = nn.SiLU()
-        self.mlp = nn.Linear(conditioning_size, 6)
+        self.mlp = nn.Sequential(
+            nn.Linear(conditioning_size, hidden_size),
+            nn.SiLU(),
+            nn.Linear(hidden_size, 6),
+        )
+
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
 
     def forward(self, c: torch.Tensor):
         """_summary_
@@ -167,16 +173,15 @@ class AdaLN(nn.Module):
             x (torch.Tensor): (B, q_len, dim)
         """
         b, q_len, dim = c.size()
-        c = c.view((b * q_len, dim))
-
-        c = self.mlp(self.silu(c)).view(b, q_len, 6).permute(2, 0, 1)
-
+        c = self.mlp(c).permute(2, 0, 1)
         return c
 
 
 class PointwiseFeedforwardMLP(nn.Module):
-    def __init__(self):
+    def __init__(self, mlp_hidden_dim: int):
         super().__init__()
+
+        self.gelu = lambda: nn.GELU(approximate="tanh")
 
     def forward(self):
         pass
@@ -207,8 +212,11 @@ class DiTBlock(nn.Module):
             eps=1.0e-6,
         )
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
-        approw_gelu = lambda: nn.GELU(approximate="tanh")
-        self.mlp = PointwiseFeedforwardMLP()
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_size, mlp_hidden_dim),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(mlp_hidden_dim, hidden_size),
+        )
         self.adaLN_modulation = AdaLN(conditioning_size=conditioning_size)
 
     def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
@@ -222,29 +230,107 @@ class DiTBlock(nn.Module):
         Returns:
             torch.Tensor: output token
         """
-        print(f"{x.size() = }")
         gamma1, beta1, alpha1, gamma2, beta2, alpha2 = self.adaLN_modulation(c)
-        print(
-            f"{gamma1.shape = }, {beta1.shape = }, {alpha1.shape = }, {gamma2.shape = }, {beta2.shape = }, {alpha2.shape = }"
+
+        x += alpha1[:, :, None] * self.attn(
+            (1 + gamma1[:, :, None]) * self.norm1(x) + beta1[:, :, None]
+        )
+        x += alpha1[:, :, None] * self.mlp(
+            (1 + gamma2[:, :, None]) * self.norm2(x) + beta1[:, :, None]
         )
 
-        x += alpha1[:, :, None] * self.attn(gamma1[:, :, None] * self.norm1(x) + beta1[:, :, None])
-        # x += alpha2[:, :, None] * self.attn(gamma2[:, :, None] * self.mlp(x) + beta2[:, :, None])
+        return x
 
+
+class TimestepEmbedding(nn.Module):
+    def __init__(self, dim: int, mlp_dim: int = 256):
+        super().__init__()
+
+        self.dim = dim
+
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, mlp_dim),
+            nn.SiLU(),
+            nn.Linear(mlp_dim, dim),
+        )
+
+    def forward(self, t: torch.Tensor):
+        """
+        t: (B, L)  -> scalar timestep per token
+        return: (B, L, dim)
+        """
+
+        B, L = t.size()
+
+        t_emb = self._sinusoidal_embedding(t, self.dim)  # (B, L, dim)
+        t_emb = self.mlp(t_emb)  # (B, L, dim)
+
+        return t_emb
+
+    def _sinusoidal_embedding(self, t, dim):
+        """
+        t: (B, L)
+        """
+        device = t.device
+
+        half = dim // 2
+        freqs = torch.exp(
+            -torch.log(torch.tensor(10000.0, device=device))
+            * torch.arange(half, device=device)
+            / half
+        )
+
+        args = t.unsqueeze(-1).float() * freqs  # (B, L, dim/2)
+
+        emb = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+
+        if dim % 2 == 1:
+            emb = torch.cat([emb, torch.zeros_like(emb[..., :1])], dim=-1)
+
+        return emb
+
+class DiT(nn.Module):
+    def __init__(
+        self,
+        n_layers: int,
+        hidden_size: int,
+        num_heads: int,
+        conditioning_size: int,
+        mlp_dim: int,
+        mlp_ratio: int,
+    ):
+        super().__init__()
+
+        self.t_embedder = TimestepEmbedding(
+            dim=conditioning_size, mlp_dim=mlp_dim
+        )
+
+        self.blocks = nn.ModuleList(
+            [
+                DiTBlock(hidden_size, num_heads, conditioning_size,mlp_ratio)
+                for _ in range(n_layers)
+            ]
+        )
+
+    def forward(self, x, t):
+        c = self.t_embedder(t)
+
+        for block in self.blocks:
+            x = block(x, c)
+
+        return x
 
 if __name__ == "__main__":
-    hidden_size = 1024
-    num_attention_heads = 8
-    q_len = 20
-    batch_size = 4
-    conditioning_size=256
-
-    dit_block = DiTBlock(
-        hidden_size=hidden_size,
-        num_heads=num_attention_heads,
-        conditioning_size=conditioning_size
+    dit = DiT(
+        n_layers=8,
+        hidden_size=128,
+        num_heads=4,
+        conditioning_size=256,
+        mlp_dim=256,
+        mlp_ratio=4
     )
 
-    x = torch.zeros((batch_size, q_len, hidden_size))
-    c = torch.zeros((batch_size, q_len, conditioning_size))
-    dit_block(x, c)
+    x = torch.zeros((4, 20, 128))
+    t = torch.zeros((4, 20))
+
+    dit(x, t)
