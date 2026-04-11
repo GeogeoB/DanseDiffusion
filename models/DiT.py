@@ -144,6 +144,14 @@ class ROPEMHAAttention(nn.Module):
         scores = torch.matmul(query_states, key_states.transpose(-1, -2)) / (
             self.head_dim**0.5
         )
+
+        # causal_mask = torch.triu(
+        #     torch.ones(q_len, q_len, device=hidden_states.device),
+        #     diagonal=1
+        # ).bool()
+
+        # scores = scores.masked_fill(causal_mask, float("-inf"))
+
         attn_weights = torch.softmax(scores, dim=-1)
         attn_output = torch.matmul(attn_weights, value_states)
 
@@ -232,11 +240,11 @@ class DiTBlock(nn.Module):
         """
         gamma1, beta1, alpha1, gamma2, beta2, alpha2 = self.adaLN_modulation(c)
 
-        x += alpha1[:, :, None] * self.attn(
+        x = x + alpha1[:, :, None] * self.attn(
             (1 + gamma1[:, :, None]) * self.norm1(x) + beta1[:, :, None]
         )
-        x += alpha1[:, :, None] * self.mlp(
-            (1 + gamma2[:, :, None]) * self.norm2(x) + beta1[:, :, None]
+        x = x + alpha2[:, :, None] * self.mlp(
+            (1 + gamma2[:, :, None]) * self.norm2(x) + beta2[:, :, None]
         )
 
         return x
@@ -321,16 +329,21 @@ class DiT(nn.Module):
         return x
 
 if __name__ == "__main__":
-    dit = DiT(
+    model = DiT(
         n_layers=8,
-        hidden_size=128,
-        num_heads=4,
+        hidden_size=204,
+        num_heads=6,
         conditioning_size=256,
         mlp_dim=256,
         mlp_ratio=4
     )
 
-    x = torch.zeros((4, 20, 128))
-    t = torch.zeros((4, 20))
+    B, L, D = 64, 25, 204
+    T = 1000  # nombre de timesteps
 
-    dit(x, t)
+    x = torch.zeros((B, L, D))
+
+    # timestep par token (entiers)
+    t = torch.randint(0, T, (B, L), dtype=torch.long)
+
+    out = model(x, t)
