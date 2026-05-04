@@ -4,6 +4,7 @@ from pathlib import Path
 import numpy as np
 from mhr.mhr import MHR, LOD
 from typing import Optional
+from tqdm import tqdm
 import trimesh
 import pyvista as pv
 import time
@@ -90,6 +91,9 @@ class MHRSequenceViewer:
         self.mesh = None
         self.faces = None
 
+        self.meshes = []
+        self.faces_list = []
+
     # -------------------------
     # 🔹 Compute ONE mesh
     # -------------------------
@@ -166,6 +170,75 @@ class MHRSequenceViewer:
     def close(self):
         self.plotter.close()
 
+    def precompute_multiple(self, sequences_shape, sequences_mhr, sequences_expr):
+        all_vertices_seq = []
+
+        for seq_shape, seq_mhr, seq_expr in zip(sequences_shape, sequences_mhr, sequences_expr):
+            vertices_seq = []
+
+            for shape, mhr, expr in zip(seq_shape, seq_mhr, seq_expr):
+                vertices, faces = self._compute_mesh(shape, mhr, expr)
+
+                if len(self.faces_list) < len(all_vertices_seq) + 1:
+                    self.faces_list.append(faces)
+
+                vertices_seq.append(vertices)
+
+            all_vertices_seq.append(vertices_seq)
+
+        return all_vertices_seq
+    
+    def _init_meshes(self, vertices_list):
+        spacing = 100.0
+
+        for i, vertices in enumerate(vertices_list):
+            faces = self.faces_list[i]
+
+            offset = np.array([i * spacing, 0, 0])
+            vertices_translated = vertices + offset
+
+            faces_pv = np.hstack([
+                np.full((faces.shape[0], 1), 3),
+                faces,
+            ]).astype(np.int32)
+
+            mesh = pv.PolyData(vertices_translated, faces_pv)
+
+            # Optionnel : couleurs différentes
+            self.plotter.add_mesh(mesh)
+
+            self.meshes.append(mesh)
+
+        self.plotter.show(auto_close=False, interactive_update=True)
+
+    def play_multiple(self, all_vertices_seq, loop=False):
+        spacing = 100.0
+        min_len = min(len(seq) for seq in all_vertices_seq)
+
+        while True:
+            for t in range(min_len):
+                current_vertices = [seq[t] for seq in all_vertices_seq]
+
+                if not self.meshes:
+                    self._init_meshes(current_vertices)
+                else:
+                    for i, (mesh, vertices) in enumerate(zip(self.meshes, current_vertices)):
+                        offset = np.array([i * spacing, 0, 0])
+                        mesh.points = vertices + offset
+
+                    self.plotter.update()
+
+                time.sleep(self.delay)
+
+            if not loop:
+                break
+
+    def display_multiple_sequences(self, sequences_shape, sequences_mhr, sequences_expr, loop=False):
+        all_vertices_seq = self.precompute_multiple(
+            sequences_shape, sequences_mhr, sequences_expr
+        )
+        self.play_multiple(all_vertices_seq, loop=loop)
+
 
 class MHRDataset(Dataset):
     def __init__(self, folder_path: str):
@@ -226,6 +299,7 @@ class SequenceDataset(Dataset):
 
         raise IndexError("Index out of range")
 
+
 def interpolate_1d(x, M):
     """
     x: [N, d]
@@ -240,8 +314,26 @@ def interpolate_1d(x, M):
 
     return x_interp.squeeze(0).T  # [M, d]
 
+class ToyDataset(torch.utils.data.Dataset):
+    def __init__(self, n_samples=1000, seq_len=100, dim=136):
+        self.data = torch.randn(n_samples, seq_len, dim) * 0.01
+
+        # structure simple (sinusoïde → pattern apprenable)
+        t = torch.linspace(0, 2 * torch.pi, seq_len)
+        pattern = torch.sin(t)[None, :, None]
+
+        self.data += pattern
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        return {
+            "mhr": self.data[idx]
+        }
+
 if __name__ == "__main__":
-    # dataset = MHRDataset("dataset/data")
+    dataset = MHRDataset("dataset/data")
     dataset = SequenceDataset("dataset/latent", sequence_size=25)
 
     data = next(iter(dataset))
@@ -250,13 +342,56 @@ if __name__ == "__main__":
 
     viewer = MHRSequenceViewer(fps=40)
 
+    i = 0
     for sequence in iter(dataset):
+        i += 1
+        if i < 510:
+            continue
+
         shape = torch.from_numpy(sequence["shape"])
         mhr = torch.from_numpy(sequence["mhr"])
         expr = torch.from_numpy(sequence["expr"])
+        
+        print(f"{mhr.size() = }")
 
-        viewer.display_sequence(
-            interpolate_1d(shape, 100), interpolate_1d(mhr, 100), interpolate_1d(expr, 100), loop=True
-        )
+        cols_zero = (mhr == 0).all(dim=0)
+        print(torch.where(cols_zero)[0])
+        input()
+
+        # viewer.display_sequence(
+        #     interpolate_1d(shape, 100), interpolate_1d(mhr, 100), interpolate_1d(expr, 100), loop=True
+        # )
 
     viewer.close()
+
+    # Compute std and mean
+
+    # def compute_mean_std(dataset):
+    #     n = 0
+    #     mean = None
+    #     m2 = None  # pour variance (Welford)
+
+    #     for data in tqdm(dataset):
+    #         _, mhr, _ = data
+
+    #         mhr = torch.from_numpy(mhr).float()  # (L, D) ou (D,)
+
+    #         # aplatir si besoin (optionnel selon ton format)
+    #         mhr = mhr.reshape(-1)
+
+    #         if mean is None:
+    #             mean = torch.zeros_like(mhr)
+    #             m2 = torch.zeros_like(mhr)
+
+    #         n += 1
+    #         delta = mhr - mean
+    #         mean += delta / n
+    #         delta2 = mhr - mean
+    #         m2 += delta * delta2
+
+    #     std = torch.sqrt(m2 / (n - 1 + 1e-8))
+
+    #     return mean, std
+
+    # dataset = MHRDataset("dataset/data")
+    # print(compute_mean_std(dataset))

@@ -68,7 +68,9 @@ class ROPE(nn.Module):
         Args:
             x (torch.Tensor): (B, num_heads, q_len, head_dim)
         """
-        cos, sin = self.rotary_positional_embedding(x)
+        cos_sin = self.rotary_positional_embedding(x)
+        cos, sin = cos_sin[0], cos_sin[1]
+
         return x * cos + self._rotated_x(x) * sin
 
 
@@ -162,37 +164,43 @@ class ROPEMHAAttention(nn.Module):
         return attn_output
 
 
-class AdaLN(nn.Module):
-    def __init__(self, conditioning_size: int, hidden_size=256):
+class AdaLNZero(nn.Module):
+    def __init__(self, hidden_size, cond_dim):
         super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(conditioning_size, hidden_size),
-            nn.SiLU(),
-            nn.Linear(hidden_size, 6),
+
+        self.norm = nn.LayerNorm(hidden_size, elementwise_affine=False)
+
+        self.hidden_size = hidden_size
+        self.mlp = nn.Sequential(nn.SiLU(), nn.Linear(cond_dim, hidden_size * 6))
+
+        nn.init.zeros_(self.mlp[1].weight)
+        nn.init.zeros_(self.mlp[1].bias)
+
+    def forward(self, x, cond):
+        """
+        x: (B, N, D)
+        cond: (B, cond_dim)
+        """
+
+        B, N, D = x.shape
+
+        params = self.mlp(cond)  # (B, 6D)
+        params = params.view(B, 6, N, D)
+
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = params.unbind(
+            1
         )
 
-        nn.init.zeros_(self.mlp[-1].weight)
-        nn.init.zeros_(self.mlp[-1].bias)
+        # broadcast
+        # shift_msa = shift_msa.unsqueeze(1)
+        # scale_msa = scale_msa.unsqueeze(1)
+        # gate_msa = gate_msa.unsqueeze(1)
 
-    def forward(self, c: torch.Tensor):
-        """_summary_
+        # shift_mlp = shift_mlp.unsqueeze(1)
+        # scale_mlp = scale_mlp.unsqueeze(1)
+        # gate_mlp = gate_mlp.unsqueeze(1)
 
-        Args:
-            x (torch.Tensor): (B, q_len, dim)
-        """
-        b, q_len, dim = c.size()
-        c = self.mlp(c).permute(2, 0, 1)
-        return c
-
-
-class PointwiseFeedforwardMLP(nn.Module):
-    def __init__(self, mlp_hidden_dim: int):
-        super().__init__()
-
-        self.gelu = lambda: nn.GELU(approximate="tanh")
-
-    def forward(self):
-        pass
+        return shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp
 
 
 class DiTBlock(nn.Module):
@@ -225,7 +233,7 @@ class DiTBlock(nn.Module):
             nn.GELU(approximate="tanh"),
             nn.Linear(mlp_hidden_dim, hidden_size),
         )
-        self.adaLN_modulation = AdaLN(conditioning_size=conditioning_size)
+        self.adaLN_modulation = AdaLNZero(hidden_size=hidden_size, cond_dim=conditioning_size)
 
     def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
         """
@@ -238,13 +246,13 @@ class DiTBlock(nn.Module):
         Returns:
             torch.Tensor: output token
         """
-        gamma1, beta1, alpha1, gamma2, beta2, alpha2 = self.adaLN_modulation(c)
+        gamma1, beta1, alpha1, gamma2, beta2, alpha2 = self.adaLN_modulation(x, c)
 
-        x = x + alpha1[:, :, None] * self.attn(
-            (1 + gamma1[:, :, None]) * self.norm1(x) + beta1[:, :, None]
+        x = x + alpha1 * self.attn(
+            (1 + gamma1) * self.norm1(x) + beta1
         )
-        x = x + alpha2[:, :, None] * self.mlp(
-            (1 + gamma2[:, :, None]) * self.norm2(x) + beta2[:, :, None]
+        x = x + alpha2* self.mlp(
+            (1 + gamma2) * self.norm2(x) + beta2
         )
 
         return x
@@ -297,6 +305,7 @@ class TimestepEmbedding(nn.Module):
 
         return emb
 
+
 class DiT(nn.Module):
     def __init__(
         self,
@@ -309,16 +318,21 @@ class DiT(nn.Module):
     ):
         super().__init__()
 
-        self.t_embedder = TimestepEmbedding(
-            dim=conditioning_size, mlp_dim=mlp_dim
-        )
+        self.t_embedder = TimestepEmbedding(dim=conditioning_size, mlp_dim=mlp_dim)
 
         self.blocks = nn.ModuleList(
             [
-                DiTBlock(hidden_size, num_heads, conditioning_size,mlp_ratio)
+                DiTBlock(hidden_size, num_heads, conditioning_size, mlp_ratio)
                 for _ in range(n_layers)
             ]
         )
+
+        self.norm = nn.LayerNorm(
+            hidden_size,
+            elementwise_affine=False,  # Doesn't learn gamme and Beta by itself
+            eps=1.0e-6,
+        )
+        self.linear = nn.Linear(hidden_size, hidden_size, bias=True)
 
     def forward(self, x, t):
         c = self.t_embedder(t)
@@ -326,7 +340,8 @@ class DiT(nn.Module):
         for block in self.blocks:
             x = block(x, c)
 
-        return x
+        return self.linear(self.norm(x))
+
 
 if __name__ == "__main__":
     model = DiT(
@@ -335,7 +350,7 @@ if __name__ == "__main__":
         num_heads=6,
         conditioning_size=256,
         mlp_dim=256,
-        mlp_ratio=4
+        mlp_ratio=4,
     )
 
     B, L, D = 64, 25, 204
