@@ -123,13 +123,13 @@ def sample_ddim(model, scheduler, T, shape, device):
     right = None
     
     eta = 0.0
-    s = 3
+    s = 0.5
 
     x_final = []
 
     B,L, D = shape
 
-    N = 10
+    N = 5
 
     for i in tqdm(range(10)):
         for t in reversed(range(T)):

@@ -61,6 +61,7 @@ if __name__ == "__main__":
 
     viewer = MHRSequenceViewer(fps=10)
 
+
     viewer.display_multiple_sequences(
         shapes, mhrs, exprs, loop=True
     )

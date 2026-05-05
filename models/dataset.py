@@ -176,6 +176,9 @@ class MHRSequenceViewer:
         for seq_shape, seq_mhr, seq_expr in zip(sequences_shape, sequences_mhr, sequences_expr):
             vertices_seq = []
 
+            N = 500
+            seq_shape, seq_mhr, seq_expr = interpolate_1d(seq_shape, N), interpolate_1d(seq_mhr, N), interpolate_1d(seq_expr, N)
+
             for shape, mhr, expr in zip(seq_shape, seq_mhr, seq_expr):
                 vertices, faces = self._compute_mesh(shape, mhr, expr)
 
