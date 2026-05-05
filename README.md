@@ -2,7 +2,7 @@
 
 Deep learning project for generating human dance motion sequences using diffusion models.
 
-<video controls src="media/Enregistrement de l'écran 2026-05-05 150915.mp4" title="Title"></video>
+![alt text](media/video.gif)
 
 > ⚠️ **Warning**: the code is not cleaned yet !!!
 
