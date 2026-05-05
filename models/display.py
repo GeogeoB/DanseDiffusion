@@ -16,13 +16,15 @@ def parse(p):
     return n, i
 
 if __name__ == "__main__":
-    paths = list(Path("output").glob("*.npz"))
-    max_n = max(parse(p)[0] for p in paths)
-    paths = sorted(
-        [p for p in paths if parse(p)[0] == max_n],
-        key=lambda p: parse(p)[1]
-    )[::2]
-    # # paths = sorted(paths, key=extract_number)[-1:]
+    # paths = list(Path("output").glob("output_*.npz"))
+    # max_n = max(parse(p)[0] for p in paths)
+    # paths = sorted(
+    #     [p for p in paths if parse(p)[0] == max_n],
+    #     key=lambda p: parse(p)[1]
+    # )[::2]
+
+    paths = list(Path("output").glob("sample_*.npz"))[::2]
+    # paths = sorted(paths, key=extract_number)[-1:]
 
     # paths = [
     #     "output/output_728_5.npz",
