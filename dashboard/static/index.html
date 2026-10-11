@@ -1,0 +1,842 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DanceDiffuser Dashboard</title>
+<style>
+  :root {
+    color-scheme: light;
+    --surface-0: #f4f3f0;
+    --surface-1: #fcfcfb;
+    --border: #e2e1dc;
+    --text-primary: #0b0b0b;
+    --text-secondary: #52514e;
+    --text-muted: #8a8984;
+    --grid: #ebeae6;
+    --series-1: #2a78d6;
+    --marker: #52514e;
+    --accent: #2a78d6;
+    --reference: #9a9890;
+    --critical: #c62828;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --surface-0: #121211;
+      --surface-1: #1a1a19;
+      --border: #2e2e2c;
+      --text-primary: #ffffff;
+      --text-secondary: #c3c2b7;
+      --text-muted: #8f8e86;
+      --grid: #2a2a28;
+      --series-1: #3987e5;
+      --marker: #c3c2b7;
+      --accent: #3987e5;
+      --reference: #77766f;
+      --critical: #e66767;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --surface-0: #121211;
+    --surface-1: #1a1a19;
+    --border: #2e2e2c;
+    --text-primary: #ffffff;
+    --text-secondary: #c3c2b7;
+    --text-muted: #8f8e86;
+    --grid: #2a2a28;
+    --series-1: #3987e5;
+    --marker: #c3c2b7;
+    --accent: #3987e5;
+    --reference: #77766f;
+    --critical: #e66767;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--surface-0);
+    color: var(--text-primary);
+    font: 14px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  header {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 12px 20px;
+    padding: 12px 16px; border-bottom: 1px solid var(--border); background: var(--surface-1);
+    position: sticky; top: 0; z-index: 10;
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  header .meta { color: var(--text-secondary); font-size: 13px; min-width: 0; overflow-wrap: anywhere; }
+  main > * { min-width: 0; }
+  header .spacer { flex: 1; }
+  select, button, input[type=number] {
+    font: inherit; color: var(--text-primary); background: var(--surface-1);
+    border: 1px solid var(--border); border-radius: 6px; padding: 4px 8px;
+  }
+  button { cursor: pointer; }
+  button:hover { border-color: var(--text-muted); }
+  button.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+  label { color: var(--text-secondary); display: inline-flex; align-items: center; gap: 6px; }
+  input[type=range] { accent-color: var(--accent); }
+
+  main {
+    display: grid; gap: 16px; padding: 16px;
+    grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr);
+    align-items: start;
+  }
+  @media (max-width: 1000px) { main { grid-template-columns: minmax(0, 1fr); } }
+
+  .panel { background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px; }
+  .panel h2 { font-size: 13px; font-weight: 600; margin: 0; color: var(--text-secondary);
+              text-transform: uppercase; letter-spacing: .04em; }
+
+  /* ---------- 3D viewer ---------- */
+  #viewer-panel { position: sticky; top: 72px; padding: 12px; display: flex; flex-direction: column; gap: 10px; }
+  @media (max-width: 1000px) { #viewer-panel { position: static; } }
+  #stage { position: relative; width: 100%; aspect-ratio: 4 / 3; border-radius: 8px; overflow: hidden; background: var(--surface-0); }
+  #stage canvas { display: block; width: 100%; height: 100%; }
+  #stage .overlay {
+    position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+    color: var(--text-secondary); pointer-events: none; text-align: center; padding: 16px;
+  }
+  #stage .badge {
+    position: absolute; left: 10px; top: 10px; padding: 3px 8px; border-radius: 6px;
+    background: var(--surface-1); color: var(--text-secondary); font-size: 12px; border: 1px solid var(--border);
+  }
+  .row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
+  .row .grow { flex: 1; min-width: 120px; }
+  .row input[type=range] { width: 100%; }
+  .step-label { font-variant-numeric: tabular-nums; min-width: 110px; font-weight: 600; }
+  .frame-label { font-variant-numeric: tabular-nums; color: var(--text-secondary); min-width: 80px; text-align: right; }
+  #samples { display: flex; flex-wrap: wrap; gap: 4px; }
+  #samples button { min-width: 34px; }
+  details summary { cursor: pointer; color: var(--text-secondary); }
+  details img { width: 100%; margin-top: 8px; border-radius: 6px; background: #fff; }
+
+  /* ---------- charts ---------- */
+  #charts { display: flex; flex-direction: column; gap: 16px; }
+  .group { padding: 12px; }
+  .group-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+  .grid { display: grid; gap: 10px; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); }
+  .chart { position: relative; border: 1px solid var(--border); border-radius: 8px; padding: 8px 8px 4px; }
+  .chart-title { font-size: 12px; color: var(--text-secondary); display: flex; justify-content: space-between; gap: 8px; }
+  .chart-title .last { color: var(--text-primary); font-variant-numeric: tabular-nums; font-weight: 600; }
+  .chart-title .right { display: flex; align-items: center; gap: 6px; }
+  .chart-title .scale-btn { font-size: 11px; padding: 0 6px; line-height: 18px; border-radius: 4px; color: var(--text-secondary); }
+  .chart-title .scale-btn.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .chart svg { display: block; width: 100%; height: auto; overflow: visible; }
+  .chart .axis text { fill: var(--text-muted); font-size: 10px; font-variant-numeric: tabular-nums; }
+  .chart .gridline { stroke: var(--grid); stroke-width: 1; }
+  .chart .line { fill: none; stroke: var(--series-1); stroke-width: 2; stroke-linejoin: round; }
+  .chart .line.raw { stroke-width: 1; opacity: .25; }
+  .chart .eval-marker { stroke: var(--marker); stroke-width: 1; stroke-dasharray: 3 3; }
+  .chart .eval-dot { fill: var(--surface-1); stroke: var(--text-muted); stroke-width: 1; cursor: pointer; }
+  .chart .eval-dot:hover { stroke: var(--text-primary); }
+  .chart .crosshair { stroke: var(--text-muted); stroke-width: 1; }
+  .chart .hover-dot { fill: var(--series-1); stroke: var(--surface-1); stroke-width: 2; }
+  .tooltip {
+    position: absolute; pointer-events: none; background: var(--surface-1); border: 1px solid var(--border);
+    border-radius: 6px; padding: 4px 8px; font-size: 12px; white-space: nowrap; box-shadow: 0 2px 8px rgba(0,0,0,.12);
+    font-variant-numeric: tabular-nums; z-index: 5;
+  }
+  .tooltip .k { color: var(--text-secondary); }
+  .empty { color: var(--text-muted); padding: 24px; text-align: center; }
+  .error { color: var(--critical); }
+</style>
+</head>
+<body>
+<header>
+  <h1>DanceDiffuser</h1>
+  <label>Run <select id="run-select"></select></label>
+  <span class="meta" id="run-meta"></span>
+  <span class="spacer"></span>
+  <label>Lissage <input type="range" id="smoothing" min="0" max="0.99" step="0.01" value="0.9" style="width:90px"><span id="smoothing-val" style="min-width:2.5em;font-variant-numeric:tabular-nums">0.90</span></label>
+  <label><input type="checkbox" id="auto-refresh" checked> Rafraîchir auto</label>
+  <label><input type="checkbox" id="follow-latest" checked> Suivre la dernière éval</label>
+  <button id="theme-toggle" title="Thème clair / sombre">◐</button>
+</header>
+
+<main>
+  <section class="panel" id="viewer-panel" aria-label="Danse générée">
+    <div class="row">
+      <h2>Danse générée</h2>
+      <span class="spacer" style="flex:1"></span>
+      <label><input type="checkbox" id="show-reference" checked> Données d'entraînement</label>
+    </div>
+    <div id="stage">
+      <div class="badge" id="stage-badge"></div>
+      <div class="overlay" id="stage-overlay">Chargement…</div>
+    </div>
+
+    <div class="row">
+      <button id="prev-eval" title="Évaluation précédente">◀</button>
+      <span class="step-label" id="step-label">—</span>
+      <button id="next-eval" title="Évaluation suivante">▶</button>
+      <div class="grow"><input type="range" id="eval-slider" min="0" max="0" value="0" aria-label="Itération"></div>
+    </div>
+    <div class="row">
+      <span style="color:var(--text-secondary)">Échantillon</span>
+      <div id="samples"></div>
+    </div>
+    <div class="row">
+      <button id="play" title="Lecture / pause (espace)">⏸</button>
+      <div class="grow"><input type="range" id="frame-slider" min="0" max="0" value="0" aria-label="Frame"></div>
+      <span class="frame-label" id="frame-label">0 / 0</span>
+      <label title="Frames générées par seconde">fps <input type="number" id="fps" min="1" max="120" value="20" style="width:64px"></label>
+      <label title="Niveau de détail du maillage MHR">Maillage
+        <select id="lod">
+          <option value="auto">auto</option>
+          <option value="1">très fin (18k)</option>
+          <option value="2">fin (10k)</option>
+          <option value="3">moyen (4.9k)</option>
+          <option value="4">standard (2.5k)</option>
+          <option value="6">léger (0.6k)</option>
+        </select></label>
+      <label title="Poses intermédiaires calculées entre les frames générées">Interpolation
+        <select id="interp">
+          <option value="cubic">cubique</option>
+          <option value="linear">linéaire</option>
+          <option value="none">aucune</option>
+        </select></label>
+    </div>
+    <details id="plot-details">
+      <summary>Courbes des features (espace normalisé)</summary>
+      <img id="plot-img" alt="Features générées vs données">
+    </details>
+  </section>
+
+  <section id="charts" aria-label="Courbes d'entraînement"></section>
+</main>
+
+<script type="importmap">
+{ "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+<script type="module">
+import * as THREE from "three";
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+
+// ============================================================ state
+const state = {
+  runs: [], run: null, evals: [], evalIndex: -1,
+  sample: 0, allSamples: false, scalars: {},
+};
+const $ = (id) => document.getElementById(id);
+const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+
+// categorical slots (fixed order) for "all samples" mode
+const SAMPLE_COLORS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7", "#e34948"];
+
+async function getJSON(url) {
+  const r = await fetch(url, { cache: "no-store" });
+  if (!r.ok) throw new Error(`${r.status} ${url}`);
+  return r.json();
+}
+
+// ============================================================ theme
+$("theme-toggle").onclick = () => {
+  const dark = document.documentElement.dataset.theme
+    ? document.documentElement.dataset.theme === "dark"
+    : matchMedia("(prefers-color-scheme: dark)").matches;
+  document.documentElement.dataset.theme = dark ? "light" : "dark";
+  try { localStorage.setItem("theme", document.documentElement.dataset.theme); } catch {}
+  applySceneTheme(); renderCharts();
+};
+try { const t = localStorage.getItem("theme"); if (t) document.documentElement.dataset.theme = t; } catch {}
+
+// ============================================================ URL hash (bookmark a run / step / sample)
+function readHash() {
+  const p = new URLSearchParams(location.hash.slice(1));
+  return { run: p.get("run"), step: p.get("step") ? +p.get("step") : null,
+           sample: p.get("sample") };
+}
+function writeHash() {
+  const ev = state.evals[state.evalIndex];
+  const p = new URLSearchParams();
+  if (state.run) p.set("run", state.run);
+  if (ev) p.set("step", ev.step);
+  p.set("sample", state.allSamples ? "all" : state.sample);
+  history.replaceState(null, "", "#" + p.toString());
+}
+
+// ============================================================ 3D scene
+const stage = $("stage");
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+stage.prepend(renderer.domElement);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(40, 4 / 3, 0.05, 100);
+camera.position.set(0, 1.7, 4.2);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, 0.9, 0);
+controls.enableDamping = true;
+
+scene.add(new THREE.HemisphereLight(0xffffff, 0x666666, 1.6));
+const sun = new THREE.DirectionalLight(0xffffff, 1.8);
+sun.position.set(2, 4, 3);
+scene.add(sun);
+
+let grid = null;
+function applySceneTheme() {
+  scene.background = new THREE.Color(css("--surface-0"));
+  if (grid) scene.remove(grid);
+  grid = new THREE.GridHelper(20, 40, css("--text-muted"), css("--border"));
+  scene.add(grid);
+}
+applySceneTheme();
+
+function resize() {
+  const w = stage.clientWidth, h = stage.clientHeight;
+  renderer.setSize(w, h, false);
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+}
+new ResizeObserver(resize).observe(stage);
+
+// mesh level of detail (auto: fine mesh for one dancer, standard when all samples are shown)
+const currentLod = () => {
+  const v = $("lod").value;
+  if (v !== "auto") return +v;
+  if (!state.allSamples) return 2;
+  const ev = state.evals[state.evalIndex];
+  return ev && ev.samples.length > 16 ? 6 : 4;
+};
+const facesByLod = new Map();
+async function loadFaces(lod) {
+  if (!facesByLod.has(lod)) {
+    const buf = await (await fetch(`/api/faces?lod=${lod}`)).arrayBuffer();
+    facesByLod.set(lod, new Uint32Array(buf));
+  }
+  return facesByLod.get(lod);
+}
+
+// binary animation -> { nFrames, nVerts, q: Int16Array, A, B } with position = q * A + B
+// (meters, centered on the first frame, lowest point on the floor). Data stay quantized in
+// memory; only the frames needed for the current pose are decoded.
+const animCache = new Map();
+async function loadAnimation(url) {
+  if (animCache.has(url)) return animCache.get(url);
+  const promise = (async () => {
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(`${r.status} — ${await r.text().then(t => t.slice(0, 200))}`);
+    const buf = await r.arrayBuffer();
+    const dv = new DataView(buf);
+    const nFrames = dv.getUint32(0, true), nVerts = dv.getUint32(4, true);
+    const off = [0, 1, 2].map(i => dv.getFloat32(8 + 4 * i, true));
+    const sc = [0, 1, 2].map(i => dv.getFloat32(20 + 4 * i, true));
+    const q = new Int16Array(buf, 32, nFrames * nVerts * 3);
+    let minQ = Infinity, cx = 0, cz = 0;
+    for (let i = 1; i < q.length; i += 3) if (q[i] < minQ) minQ = q[i];
+    for (let i = 0; i < nVerts * 3; i += 3) { cx += q[i]; cz += q[i + 2]; }
+    cx /= nVerts; cz /= nVerts;
+    const A = new Float32Array(sc.map(v => v * 0.01));
+    const B = new Float32Array([-cx * A[0], -minQ * A[1], -cz * A[2]]);  // offsets cancel out
+    return { nFrames, nVerts, q, A, B };
+  })();
+  animCache.set(url, promise);
+  promise.catch(() => animCache.delete(url));
+  return promise;
+}
+
+// actors currently displayed: { mesh, anim }
+let actors = [];
+let frame = 0, playing = true, lastTime = 0;
+
+function clearActors() {
+  for (const a of actors) { scene.remove(a.mesh); a.mesh.geometry.dispose(); a.mesh.material.dispose(); }
+  actors = [];
+}
+
+function makeActor(anim, color, x, faces) {
+  const geom = new THREE.BufferGeometry();
+  geom.setAttribute("position", new THREE.BufferAttribute(new Float32Array(anim.nVerts * 3), 3));
+  geom.setIndex(new THREE.BufferAttribute(faces, 1));
+  const mat = new THREE.MeshStandardMaterial({ color, roughness: 0.6, metalness: 0.05 });
+  const mesh = new THREE.Mesh(geom, mat);
+  mesh.position.x = x;
+  scene.add(mesh);
+  return { mesh, anim };
+}
+
+// f: fractional frame position. Poses between generated frames are interpolated per vertex:
+// linear, or Catmull-Rom (continuous velocity across frames, no jerk at each keyframe).
+// Both are affine combinations (weights sum to 1), so they are applied to the quantized values.
+function setFrame(f) {
+  const mode = $("interp").value;
+  for (const a of actors) {
+    const { nFrames, nVerts, q, A, B } = a.anim;
+    const local = f % nFrames;
+    const k = Math.floor(local);
+    const t = mode === "none" || k >= nFrames - 1 ? 0 : local - k;
+    const L = nVerts * 3;
+    let idx, w;
+    if (t === 0) { idx = [k]; w = [1]; }
+    else if (mode === "linear") { idx = [k, k + 1]; w = [1 - t, t]; }
+    else {
+      const t2 = t * t, t3 = t2 * t;
+      idx = [Math.max(k - 1, 0), k, k + 1, Math.min(k + 2, nFrames - 1)];
+      w = [-0.5 * t3 + t2 - 0.5 * t, 1.5 * t3 - 2.5 * t2 + 1, -1.5 * t3 + 2 * t2 + 0.5 * t, 0.5 * t3 - 0.5 * t2];
+    }
+    const o = idx.map(j => j * L);
+    const out = a.mesh.geometry.attributes.position.array;
+    for (let v = 0; v < L; v += 3) {
+      for (let c = 0; c < 3; c++) {
+        const i = v + c;
+        let acc = 0;
+        for (let j = 0; j < o.length; j++) acc += w[j] * q[o[j] + i];
+        out[i] = acc * A[c] + B[c];
+      }
+    }
+    a.mesh.geometry.attributes.position.needsUpdate = true;
+    a.mesh.geometry.computeVertexNormals();
+    a.mesh.geometry.computeBoundingSphere();
+  }
+  const n = maxFrames();
+  const shown = n ? Math.floor(f % n) : 0;
+  $("frame-slider").value = shown;
+  $("frame-label").textContent = `${n ? shown + 1 : 0} / ${n}`;
+}
+const maxFrames = () => actors.reduce((m, a) => Math.max(m, a.anim.nFrames), 0);
+
+let loadToken = 0;
+async function loadScene() {
+  const ev = state.evals[state.evalIndex];
+  const token = ++loadToken;
+  const overlay = $("stage-overlay");
+  if (!ev) { clearActors(); overlay.textContent = "Pas encore d'évaluation pour ce run."; overlay.style.display = "flex"; return; }
+  overlay.textContent = "Calcul des maillages… (quelques secondes pour une longue séquence en maillage fin)"; overlay.style.display = "flex";
+
+  try {
+    const lod = currentLod();
+    const faces = await loadFaces(lod);
+    const indices = state.allSamples ? ev.samples : [ev.samples.includes(state.sample) ? state.sample : ev.samples[0]];
+    const urls = indices.map(i => `/api/runs/${encodeURIComponent(state.run)}/evals/${ev.step}/samples/${i}?lod=${lod}`);
+    const showRef = $("show-reference").checked;
+    const jobs = urls.map(loadAnimation);
+    if (showRef) jobs.push(loadAnimation(`/api/runs/${encodeURIComponent(state.run)}/reference?lod=${lod}`));
+    const anims = await Promise.all(jobs);
+    if (token !== loadToken) return;
+
+    clearActors();
+    const spacing = 1.0;
+    const n = anims.length;
+    const nGen = n - (showRef ? 1 : 0);
+    if (nGen > 12) {
+      // square grid of the generated dances (10 x 10 for 100), the reference apart on the left
+      const cols = Math.ceil(Math.sqrt(nGen)), rows = Math.ceil(nGen / cols);
+      const gap = spacing * 1.2;
+      anims.forEach((anim, i) => {
+        const isRef = showRef && i === n - 1;
+        const color = isRef ? css("--reference") : SAMPLE_COLORS[indices[i] % 8];
+        const x = isRef ? -((cols - 1) / 2 + 2) * gap : ((i % cols) - (cols - 1) / 2) * gap;
+        const actor = makeActor(anim, color, x, faces);
+        actor.mesh.position.z = isRef ? 0 : (Math.floor(i / cols) - (rows - 1) / 2) * gap;
+        actors.push(actor);
+      });
+      const size = Math.max(cols, rows) * gap;
+      controls.target.set(0, 0.5, 0);
+      camera.position.set(0, size * 0.9, size * 1.15);
+    } else {
+      // one row
+      anims.forEach((anim, i) => {
+        const isRef = showRef && i === n - 1;
+        const color = isRef ? css("--reference") : (state.allSamples ? SAMPLE_COLORS[indices[i] % 8] : css("--series-1"));
+        actors.push(makeActor(anim, color, (i - (n - 1) / 2) * spacing, faces));
+      });
+      const width = (n - 1) * spacing;
+      controls.target.set(0, 0.9, 0);
+      camera.position.set(0, 1.7, Math.max(3.8, width * 1.1 + 2.8));
+    }
+    $("frame-slider").max = Math.max(0, maxFrames() - 1);
+    setFrame(frame);
+    overlay.style.display = "none";
+    $("stage-badge").textContent =
+      `pas ${ev.step.toLocaleString("fr-FR")} · ` +
+      (state.allSamples ? `${indices.length} échantillons` : `échantillon ${indices[0]}`) +
+      (showRef ? " · gris = données" : "");
+  } catch (e) {
+    if (token !== loadToken) return;
+    overlay.innerHTML = `<span class="error">Erreur : ${e.message}</span>`;
+    overlay.style.display = "flex";
+  }
+}
+
+function animate(t) {
+  requestAnimationFrame(animate);
+  const fps = Math.max(1, +$("fps").value || 20);
+  if (playing && actors.length) {
+    // the playhead advances continuously (every display refresh), between generated frames
+    const dt = Math.min((t - lastTime) / 1000, 0.1);
+    frame = (frame + dt * fps) % Math.max(1, maxFrames());
+    setFrame(frame);
+  }
+  lastTime = t;
+  controls.update();
+  renderer.render(scene, camera);
+}
+requestAnimationFrame(animate);
+
+$("play").onclick = () => { playing = !playing; $("play").textContent = playing ? "⏸" : "▶"; };
+$("frame-slider").oninput = (e) => { frame = +e.target.value; playing = false; $("play").textContent = "▶"; setFrame(frame); };
+try { const v = localStorage.getItem("interp"); if (v) $("interp").value = v; } catch {}
+try { const v = localStorage.getItem("lod"); if (v) $("lod").value = v; } catch {}
+$("lod").onchange = () => { try { localStorage.setItem("lod", $("lod").value); } catch {} loadScene(); };
+$("interp").onchange = () => { try { localStorage.setItem("interp", $("interp").value); } catch {} setFrame(frame); };
+document.addEventListener("keydown", (e) => {
+  if (e.target.tagName === "INPUT" || e.target.tagName === "SELECT") return;
+  if (e.code === "Space") { e.preventDefault(); $("play").click(); }
+  if (e.code === "ArrowLeft") selectEval(state.evalIndex - 1, true);
+  if (e.code === "ArrowRight") selectEval(state.evalIndex + 1, true);
+});
+$("show-reference").onchange = loadScene;
+
+// ============================================================ eval / sample selection
+function renderSampleButtons() {
+  const ev = state.evals[state.evalIndex];
+  const box = $("samples");
+  box.innerHTML = "";
+  if (!ev) return;
+  const pick = (i) => { state.allSamples = false; state.sample = i; renderSampleButtons(); writeHash(); loadScene(); };
+  if (ev.samples.length > 20) {
+    // many samples: compact selector instead of one button per sample
+    const pos = Math.max(0, ev.samples.indexOf(state.sample));
+    const prev = document.createElement("button"), next = document.createElement("button");
+    const input = document.createElement("input");
+    prev.textContent = "◀"; next.textContent = "▶";
+    input.type = "number"; input.min = ev.samples[0]; input.max = ev.samples[ev.samples.length - 1];
+    input.value = ev.samples[pos]; input.style.width = "70px";
+    input.className = state.allSamples ? "" : "active";
+    prev.onclick = () => pick(ev.samples[Math.max(0, pos - 1)]);
+    next.onclick = () => pick(ev.samples[Math.min(ev.samples.length - 1, pos + 1)]);
+    input.onchange = () => { const v = +input.value; if (ev.samples.includes(v)) pick(v); };
+    const count = document.createElement("span");
+    count.textContent = `/ ${ev.samples.length}`; count.style.color = "var(--text-secondary)";
+    box.append(prev, input, next, count);
+  } else {
+    for (const i of ev.samples) {
+      const b = document.createElement("button");
+      b.textContent = i;
+      b.className = !state.allSamples && state.sample === i ? "active" : "";
+      b.onclick = () => pick(i);
+      box.append(b);
+    }
+  }
+  const all = document.createElement("button");
+  all.textContent = "Tous";
+  all.className = state.allSamples ? "active" : "";
+  all.onclick = () => { state.allSamples = true; renderSampleButtons(); writeHash(); loadScene(); };
+  box.append(all);
+}
+
+function selectEval(index, userAction = false) {
+  if (!state.evals.length) { state.evalIndex = -1; updateEvalUI(); loadScene(); return; }
+  index = Math.max(0, Math.min(state.evals.length - 1, index));
+  if (userAction) $("follow-latest").checked = index === state.evals.length - 1;
+  const changed = index !== state.evalIndex;
+  state.evalIndex = index;
+  updateEvalUI();
+  if (changed) { writeHash(); loadScene(); renderMarkers(); }
+}
+
+function updateEvalUI() {
+  const ev = state.evals[state.evalIndex];
+  $("eval-slider").max = Math.max(0, state.evals.length - 1);
+  $("eval-slider").value = Math.max(0, state.evalIndex);
+  $("step-label").textContent = ev ? `pas ${ev.step.toLocaleString("fr-FR")}` : "—";
+  $("prev-eval").disabled = state.evalIndex <= 0;
+  $("next-eval").disabled = state.evalIndex >= state.evals.length - 1;
+  renderSampleButtons();
+  const img = $("plot-img");
+  if (ev && ev.plot) {
+    img.src = `/api/runs/${encodeURIComponent(state.run)}/evals/${ev.step}/plot`;
+    $("plot-details").style.display = "";
+  } else {
+    $("plot-details").style.display = "none";
+  }
+}
+
+$("eval-slider").oninput = (e) => selectEval(+e.target.value, true);
+$("prev-eval").onclick = () => selectEval(state.evalIndex - 1, true);
+$("next-eval").onclick = () => selectEval(state.evalIndex + 1, true);
+$("follow-latest").onchange = (e) => { if (e.target.checked) selectEval(state.evals.length - 1); };
+
+// ============================================================ charts (inline SVG, small multiples)
+const GROUPS = [
+  { title: "Entraînement", match: (t) => t.startsWith("train/") },
+  { title: "Débruitage x₀ (train)", match: (t) => t.startsWith("train_x0_mse/") },
+  { title: "Débruitage x₀ (validation)", match: (t) => t.startsWith("val_") },
+  { title: "Générations", match: (t) => t.startsWith("sample/") },
+];
+const TAG_LABELS = {
+  "train/total": "loss totale", "train/x0": "loss x₀ (pondérée)", "train/velocity": "loss vitesse",
+  "train/grad_norm": "norme du gradient", "train/lr": "learning rate",
+  "sample/nn_mse": "distance au plus proche voisin (toute la séquence)",
+  "sample/nn_mse_first": "distance au plus proche voisin (1re fenêtre)", "sample/jerk_ratio": "ratio de jerk (1 = comme les données)",
+};
+const labelFor = (tag) => TAG_LABELS[tag] || tag.replace(/^(train_|val_)?x0_mse\//, "MSE ").replace(/^val_/, "");
+const LOG_DEFAULT = (tag) => !/lr|jerk_ratio/.test(tag);
+const logScale = {};  // per group
+let chartLog = {};    // per chart override: tag -> bool
+try { chartLog = JSON.parse(localStorage.getItem("chartLog") || "{}"); } catch {}
+try { Object.assign(logScale, JSON.parse(localStorage.getItem("groupLog") || "{}")); } catch {}
+function saveScales() {
+  try { localStorage.setItem("chartLog", JSON.stringify(chartLog)); localStorage.setItem("groupLog", JSON.stringify(logScale)); } catch {}
+}
+
+function fmt(v) {
+  if (v === 0) return "0";
+  const a = Math.abs(v);
+  if (a >= 1e4 || a < 1e-3) return v.toExponential(1);
+  if (a >= 100) return v.toFixed(0);
+  if (a >= 1) return v.toFixed(2);
+  return v.toPrecision(2);
+}
+const fmtStep = (s) => s >= 1000 ? `${(s / 1000).toFixed(s % 1000 ? 1 : 0)}k` : `${s}`;
+
+function niceTicks(lo, hi, n = 4) {
+  const span = hi - lo || Math.abs(hi) || 1;
+  const step0 = span / n, mag = 10 ** Math.floor(Math.log10(step0));
+  const step = [1, 2, 5, 10].map(m => m * mag).find(s => s >= step0);
+  const ticks = [];
+  for (let v = Math.ceil(lo / step) * step; v <= hi + 1e-12; v += step) ticks.push(+v.toPrecision(12));
+  return ticks;
+}
+
+const chartRefs = [];  // for marker updates
+const smoothing = () => +$("smoothing").value;
+try { const v = localStorage.getItem("smoothing"); if (v !== null) $("smoothing").value = v; } catch {}
+$("smoothing-val").textContent = smoothing().toFixed(2);
+$("smoothing").oninput = () => {
+  $("smoothing-val").textContent = smoothing().toFixed(2);
+  try { localStorage.setItem("smoothing", smoothing()); } catch {}
+  renderCharts();
+};
+
+function renderCharts() {
+  const root = $("charts");
+  root.innerHTML = "";
+  chartRefs.length = 0;
+  const num = (t) => { const m = t.match(/t(\d+)$/); return m ? +m[1] : Infinity; };
+  const tags = Object.keys(state.scalars).sort((a, b) => num(a) - num(b) || a.localeCompare(b));
+  if (!tags.length) { root.innerHTML = `<div class="panel empty">Pas encore de courbes pour ce run.</div>`; return; }
+
+  for (const group of GROUPS) {
+    const gtags = tags.filter(group.match);
+    if (!gtags.length) continue;
+    if (!(group.title in logScale)) logScale[group.title] = true;
+
+    const panel = document.createElement("div");
+    panel.className = "panel group";
+    panel.innerHTML = `<div class="group-head"><h2>${group.title}</h2>
+      <label><input type="checkbox" ${logScale[group.title] ? "checked" : ""}> échelle log</label></div>
+      <div class="grid"></div>`;
+    panel.querySelector("input").onchange = (e) => {
+      logScale[group.title] = e.target.checked;
+      for (const t of gtags) delete chartLog[t];  // the group switch resets per-chart overrides
+      saveScales(); renderCharts();
+    };
+    const gridEl = panel.querySelector(".grid");
+    for (const tag of gtags) gridEl.append(makeChart(tag, chartLog[tag] ?? (logScale[group.title] && LOG_DEFAULT(tag))));
+    root.append(panel);
+  }
+  renderMarkers();
+}
+
+function makeChart(tag, useLog) {
+  const all = state.scalars[tag].filter(p => Number.isFinite(p[1]));
+  if (useLog && !all.some(p => p[1] > 0)) useLog = false;  // log impossible (all values <= 0)
+  const pts = useLog ? all.filter(p => p[1] > 0) : all;
+  const el = document.createElement("div");
+  el.className = "chart";
+  const last = all.length ? all[all.length - 1][1] : NaN;
+  el.innerHTML = `<div class="chart-title"><span>${labelFor(tag)}</span><span class="right">
+    <span class="last">${fmt(last)}</span>
+    <button class="scale-btn ${useLog ? "on" : ""}" title="Échelle logarithmique / linéaire">${useLog ? "log" : "lin"}</button></span></div>`;
+  el.querySelector(".scale-btn").onclick = () => { chartLog[tag] = !useLog; saveScales(); renderCharts(); };
+  if (pts.length < 1) { el.insertAdjacentHTML("beforeend", `<div class="empty">—</div>`); return el; }
+
+  const W = 300, H = 150, m = { l: 40, r: 8, t: 8, b: 20 };
+  const tr = (v) => useLog ? Math.log10(v) : v;
+  const xs = pts.map(p => p[0]), ys = pts.map(p => tr(p[1]));
+  const x0 = Math.min(...xs), x1 = Math.max(...xs, x0 + 1);
+  let y0 = Math.min(...ys), y1 = Math.max(...ys);
+  if (y0 === y1) { y0 -= 0.5; y1 += 0.5; }
+  const pad = (y1 - y0) * 0.05; y0 -= pad; y1 += pad;
+  const sx = (x) => m.l + (x - x0) / (x1 - x0) * (W - m.l - m.r);
+  const sy = (y) => m.t + (1 - (y - y0) / (y1 - y0)) * (H - m.t - m.b);
+
+  const ns = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(ns, "svg");
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  svg.setAttribute("role", "img");
+  svg.setAttribute("aria-label", `${labelFor(tag)} : dernière valeur ${fmt(last)}`);
+
+  let html = `<g class="axis">`;
+  const yticks = useLog
+    ? niceTicks(y0, y1, 3).filter(v => Number.isInteger(v) || y1 - y0 < 1)
+    : niceTicks(y0, y1, 3);
+  for (const v of yticks) {
+    html += `<line class="gridline" x1="${m.l}" x2="${W - m.r}" y1="${sy(v)}" y2="${sy(v)}"/>`;
+    html += `<text x="${m.l - 4}" y="${sy(v) + 3}" text-anchor="end">${fmt(useLog ? 10 ** v : v)}</text>`;
+  }
+  for (const v of niceTicks(x0, x1, 3)) {
+    html += `<text x="${sx(v)}" y="${H - 5}" text-anchor="middle">${fmtStep(v)}</text>`;
+  }
+  html += `</g>`;
+  const path = (arr) => arr.map((p, i) => `${i ? "L" : "M"}${sx(p[0]).toFixed(1)},${sy(tr(p[1])).toFixed(1)}`).join("");
+  const alpha = smoothing();
+  if (alpha > 0 && pts.length > 20) {
+    let ema = 0, w = 0;
+    const smooth = pts.map(([s, v]) => { ema = alpha * ema + (1 - alpha) * tr(v); w = alpha * w + (1 - alpha);
+                                          const y = ema / w; return [s, useLog ? 10 ** y : y]; });
+    html += `<path class="line raw" d="${path(pts)}" vector-effect="non-scaling-stroke"/>`;
+    html += `<path class="line" d="${path(smooth)}" vector-effect="non-scaling-stroke"/>`;
+  } else {
+    html += `<path class="line" d="${path(pts)}" vector-effect="non-scaling-stroke"/>`;
+  }
+  html += `<g class="markers"></g>`;
+  html += `<line class="crosshair" y1="${m.t}" y2="${H - m.b}" visibility="hidden" vector-effect="non-scaling-stroke"/>`;
+  html += `<circle class="hover-dot" r="4" visibility="hidden" vector-effect="non-scaling-stroke"/>`;
+  svg.innerHTML = html;
+  el.append(svg);
+
+  // hover: crosshair + tooltip on the nearest point
+  const tip = document.createElement("div");
+  tip.className = "tooltip"; tip.style.display = "none";
+  el.append(tip);
+  const cross = svg.querySelector(".crosshair"), dot = svg.querySelector(".hover-dot");
+  svg.addEventListener("pointermove", (e) => {
+    const r = svg.getBoundingClientRect();
+    const x = (e.clientX - r.left) / r.width * W;
+    const step = x0 + (x - m.l) / (W - m.l - m.r) * (x1 - x0);
+    let best = 0;
+    for (let i = 1; i < pts.length; i++) if (Math.abs(pts[i][0] - step) < Math.abs(pts[best][0] - step)) best = i;
+    const [bs, bv] = pts[best];
+    cross.setAttribute("x1", sx(bs)); cross.setAttribute("x2", sx(bs)); cross.setAttribute("visibility", "visible");
+    dot.setAttribute("cx", sx(bs)); dot.setAttribute("cy", sy(tr(bv))); dot.setAttribute("visibility", "visible");
+    tip.innerHTML = `<span class="k">pas</span> ${bs.toLocaleString("fr-FR")} &nbsp; <b>${fmt(bv)}</b>`;
+    tip.style.display = "block";
+    const px = sx(bs) / W * r.width, py = sy(tr(bv)) / H * r.height;
+    tip.style.left = `${Math.min(px + 12, r.width - tip.offsetWidth)}px`;
+    tip.style.top = `${py + 8}px`;
+  });
+  svg.addEventListener("pointerleave", () => {
+    cross.setAttribute("visibility", "hidden"); dot.setAttribute("visibility", "hidden"); tip.style.display = "none";
+  });
+  // click: jump to the closest evaluation
+  svg.addEventListener("click", (e) => {
+    if (!state.evals.length) return;
+    const r = svg.getBoundingClientRect();
+    const step = x0 + ((e.clientX - r.left) / r.width * W - m.l) / (W - m.l - m.r) * (x1 - x0);
+    let best = 0;
+    state.evals.forEach((ev, i) => { if (Math.abs(ev.step - step) < Math.abs(state.evals[best].step - step)) best = i; });
+    selectEval(best, true);
+  });
+  svg.style.cursor = "crosshair";
+
+  chartRefs.push({ svg, sx, x0, x1, H, m, W });
+  return el;
+}
+
+function renderMarkers() {
+  const ev = state.evals[state.evalIndex];
+  for (const c of chartRefs) {
+    const g = c.svg.querySelector(".markers");
+    let html = "";
+    if (ev && ev.step >= c.x0 && ev.step <= c.x1) {
+      html += `<line class="eval-marker" x1="${c.sx(ev.step)}" x2="${c.sx(ev.step)}" y1="${c.m.t}" y2="${c.H - c.m.b}" vector-effect="non-scaling-stroke"/>`;
+    }
+    g.innerHTML = html;
+  }
+}
+
+// ============================================================ data loading
+async function loadRuns() {
+  state.runs = await getJSON("/api/runs");
+  const sel = $("run-select");
+  const current = state.run;
+  sel.innerHTML = state.runs.map(r => `<option value="${r.name}">${r.name}</option>`).join("");
+  if (!state.runs.length) { $("charts").innerHTML = `<div class="panel empty">Aucun run dans runs/.</div>`; return; }
+  const wanted = current || readHash().run;
+  state.run = state.runs.some(r => r.name === wanted) ? wanted : state.runs[0].name;
+  sel.value = state.run;
+  updateRunMeta();
+}
+
+function updateRunMeta() {
+  const r = state.runs.find(r => r.name === state.run);
+  if (!r) return;
+  const c = r.config || {};
+  const parts = [];
+  if (c.sequences?.length) parts.push(`${c.sequences.length} séquence(s)`);
+  if (c.hidden) parts.push(`DiT ${c.depth}×${c.hidden}`);
+  if (c.window) parts.push(`fenêtre ${c.window}`);
+  if (c.steps) parts.push(`${c.steps.toLocaleString("fr-FR")} pas`);
+  if (c.eval_every) parts.push(`éval tous les ${c.eval_every.toLocaleString("fr-FR")} pas`);
+  $("run-meta").textContent = parts.join(" · ");
+  if (c.fps) $("fps").value = c.fps;  // playback rate stored with the run (frames per second)
+  if (c.note) $("run-meta").title = c.note;
+}
+
+async function refreshRun(initial = false) {
+  const run = state.run;
+  if (!run) return;
+  const [scalars, evals] = await Promise.all([
+    getJSON(`/api/runs/${encodeURIComponent(run)}/scalars`),
+    getJSON(`/api/runs/${encodeURIComponent(run)}/evals`),
+  ]);
+  if (run !== state.run) return;
+  state.scalars = scalars;
+
+  const prevStep = state.evals[state.evalIndex]?.step;
+  const grew = evals.length !== state.evals.length;
+  state.evals = evals;
+
+  let index;
+  if (initial) {
+    const h = readHash();
+    if (h.sample === "all") state.allSamples = true;
+    else if (h.sample != null) state.sample = +h.sample;
+    index = h.step != null && h.run === run ? evals.findIndex(e => e.step === h.step) : -1;
+    if (index < 0) index = evals.length - 1;
+    if (index !== evals.length - 1) $("follow-latest").checked = false;
+    state.evalIndex = -1;
+  } else if ($("follow-latest").checked) {
+    index = evals.length - 1;
+  } else {
+    index = Math.max(0, evals.findIndex(e => e.step === prevStep));
+  }
+  renderCharts();
+  if (initial || grew || index !== state.evalIndex) selectEval(index);
+  else updateEvalUI();
+}
+
+$("run-select").onchange = async (e) => {
+  state.run = e.target.value; state.evals = []; state.evalIndex = -1;
+  history.replaceState(null, "", "#run=" + encodeURIComponent(state.run));
+  updateRunMeta();
+  await refreshRun(true);
+};
+
+async function poll() {
+  if ($("auto-refresh").checked) {
+    try { await loadRuns(); await refreshRun(); } catch (e) { console.warn(e); }
+  }
+  setTimeout(poll, 15000);
+}
+
+(async () => {
+  try {
+    await loadRuns();
+    await refreshRun(true);
+  } catch (e) {
+    $("charts").innerHTML = `<div class="panel empty error">Impossible de joindre le serveur : ${e.message}</div>`;
+  }
+  setTimeout(poll, 15000);
+})();
+</script>
+</body>
+</html>

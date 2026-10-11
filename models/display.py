@@ -4,7 +4,7 @@ import torch
 import numpy as np
 import re
 
-from dataset import MHRSequenceViewer, interpolate_1d
+from viewer import MHRSequenceViewer
 
 def extract_number(p):
     # récupère le nombre dans "output_728"

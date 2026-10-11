@@ -68,22 +68,50 @@ Main learning target: **model parameters**
 
 ## ⚙️ Training Setup
 
-- Cosine / shifted cosine noise schedule
-- Min-SNR weighting strategy
-- Transformer-based backbone (planned / partial)
-- Positional encoding via RoPE
+- Cosine noise schedule (1000 steps), x₀-prediction
+- Diffusion Forcing noise levels: one independent timestep per frame, plus shared timesteps
+  (full-sequence diffusion) and clean prefixes (autoregressive context)
+- Truncated Min-SNR weighting: `w = clamp(SNR, 1, γ)`
+- DiT backbone with per-frame adaLN-Zero conditioning, RoPE and QK-norm
+- Per-feature normalization, EMA weights, bf16, AdamW + warmup / cosine LR
 
-Training follows a progressive difficulty schedule:
-1. Short sequences first
-2. Gradual extension to longer sequences
+## 🛠️ Usage
+
+```bash
+# environment (PyTorch CUDA 12.8)
+uv sync
+
+# stack per-frame SAM 3D Body outputs (dataset/data/<seq>/frame_*.npz) into dataset/latent/<seq>.npz
+uv run python utils/create_sequences.py [--sequences <seq> ...]
+
+# train (logs, checkpoints and samples in runs/<run-name>)
+uv run python models/train.py --run-name my_run [--sequences <seq> ...] [--val-sequences <seq> ...]
+uv run tensorboard --logdir runs
+
+# sample with a checkpoint
+uv run python models/sample.py runs/my_run/checkpoints/last.pt --n 4 --frames 300 [--pyramid 2]
+
+# long generation shown in the dashboard as runs/long_5min, with more diversity:
+#   --eta 1            stochastic sampling (0 = deterministic DDIM)
+#   --context-t 200    slightly noised context: follows the past less literally
+#   --guidance 0.7     history guidance (<1: more diversity, >1: more coherence)
+uv run python models/sample.py runs/my_run/checkpoints/last.pt --n 10 --frames 3000 --context 16 \
+    --eta 1 --context-t 200 --guidance 0.7 --run long_5min
+
+# dashboard (curves + 3D samples of every evaluation) on http://localhost:8000
+uv run --project dashboard python dashboard/server.py
+```
+
+Samples are saved in the `dataset/latent` format and can be played with `models/viewer.py`
+(requires the MHR assets, `pyvista` and `trimesh`).
 
 
 ## 🎯 Sampling
 
-Two sampling strategies:
-- **DDPM**: stochastic, stable
-- **DDIM**: deterministic, faster inference
-- **Diffusion forcing**
+- **DDIM** with one timestep per frame (`eta` > 0 for stochastic sampling)
+- **Diffusion Forcing** autoregressive generation with a sliding window: each chunk is
+  generated conditioned on the last frames, optionally with the pyramid scheduling matrix
+  (each frame lags `pyramid` denoising steps behind the previous one)
 
 ## 🚀 Future Work
 

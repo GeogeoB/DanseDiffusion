@@ -1,364 +1,236 @@
-import torch.nn as nn
+import math
+
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 
-class RotaryPositionalEmbedding(nn.Module):
-    """Rotary positional embedding
-    Reference : https://blog.eleuther.ai/rotary-embeddings/ Paper: https://huggingface.co/papers/2104.09864
+class RotaryEmbedding(nn.Module):
+    """Rotary positional embedding (half-split convention, as in LLaMA / GPT-NeoX).
+    Reference: https://arxiv.org/abs/2104.09864
     """
 
-    def __init__(
-        self,
-        hidden_size: int,
-        num_attention_heads: int,
-        rotary_embedding_base: int = 10_000,
-    ):
+    def __init__(self, head_dim: int, base: int = 10_000):
         super().__init__()
-        dim = hidden_size // num_attention_heads
-        base = rotary_embedding_base
+        if head_dim % 2 != 0:
+            raise ValueError(f"head_dim must be even for RoPE, got {head_dim}")
 
-        inv_freq = 1.0 / (
-            base ** (torch.arange(0, dim, 2, dtype=torch.int64).float() / dim)
-        )
-
+        inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2).float() / head_dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self.cached_sequence_length = None
-        self.cached_rotary_positional_embedding = None
 
-    def forward(self, hidden_states):
-        sequence_length = hidden_states.shape[2]
+    def forward(self, seq_len: int, dtype: torch.dtype):
+        positions = torch.arange(seq_len, device=self.inv_freq.device).float()
+        freqs = torch.outer(positions, self.inv_freq)  # (L, head_dim/2)
+        emb = torch.cat((freqs, freqs), dim=-1)  # (L, head_dim)
 
-        if (
-            sequence_length == self.cached_sequence_length
-            and self.cached_rotary_positional_embedding is not None
-        ):
-            return self.cached_rotary_positional_embedding
-
-        self.cached_sequence_length = sequence_length
-        # Embeddings are computed in the dtype of the inv_freq constant
-        time_stamps = torch.arange(sequence_length).type_as(self.inv_freq)
-        freqs = torch.einsum("i,j->ij", time_stamps, self.inv_freq)
-        embeddings = torch.cat((freqs, freqs), dim=-1)
-
-        cos_embeddings = embeddings.cos()[None, None, :, :]
-        sin_embeddings = embeddings.sin()[None, None, :, :]
-        # Computed embeddings are cast to the dtype of the hidden state inputs
-        self.cached_rotary_positional_embedding = torch.stack(
-            [cos_embeddings, sin_embeddings]
-        ).type_as(hidden_states)
-        return self.cached_rotary_positional_embedding
+        return emb.cos().to(dtype)[None, None], emb.sin().to(dtype)[None, None]
 
 
-class ROPE(nn.Module):
-    def __init__(self, hidden_size: int, num_attention_heads: int):
+def rotate_half(x: torch.Tensor) -> torch.Tensor:
+    x1, x2 = x.chunk(2, dim=-1)
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    return x * cos + rotate_half(x) * sin
+
+
+class RoPEAttention(nn.Module):
+    """Multi-head self-attention with RoPE and QK-norm."""
+
+    def __init__(self, hidden_size: int, num_heads: int, causal: bool = False):
         super().__init__()
-        self.rotary_positional_embedding = RotaryPositionalEmbedding(
-            hidden_size=hidden_size, num_attention_heads=num_attention_heads
-        )
-
-    def _rotated_x(self, x):
-        x1 = x[..., ::2]
-        x2 = x[..., 1::2]
-
-        return torch.stack((-x2, x1), dim=-1).flatten(-2)
-
-    def forward(self, x: torch.Tensor):
-        """_summary_
-
-        Args:
-            x (torch.Tensor): (B, num_heads, q_len, head_dim)
-        """
-        cos_sin = self.rotary_positional_embedding(x)
-        cos, sin = cos_sin[0], cos_sin[1]
-
-        return x * cos + self._rotated_x(x) * sin
-
-
-class ROPEMHAAttention(nn.Module):
-    """
-    Implementation of ROPEAttention from https://github.com/huggingface/transformers/blob/e42587f596181396e1c4b63660abf0c736b10dae/src/transformers/models/llama/modeling_llama.py#L233-L368
-    """
-
-    def __init__(
-        self,
-        hidden_size: int,
-        num_heads: int = 1,
-    ):
-        super().__init__()
-
-        self.hidden_size = hidden_size
-        self.num_heads = num_heads
-        self.head_dim = hidden_size // self.num_heads
-
-        if (self.head_dim * self.num_heads) != self.hidden_size:
+        if hidden_size % num_heads != 0:
             raise ValueError(
-                f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
-                f" and `num_heads`: {self.num_heads})."
+                f"hidden_size ({hidden_size}) must be divisible by num_heads ({num_heads})"
             )
 
-        self.q_proj = nn.Linear(
-            self.hidden_size, self.num_heads * self.head_dim, bias=False
-        )
-        self.k_proj = nn.Linear(
-            self.hidden_size, self.num_heads * self.head_dim, bias=False
-        )
-        self.v_proj = nn.Linear(
-            self.hidden_size, self.num_heads * self.head_dim, bias=False
-        )
-        self.o_proj = nn.Linear(
-            self.num_heads * self.head_dim, self.hidden_size, bias=False
-        )
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
+        self.causal = causal
 
-        self.positional_embedding = ROPE(
-            hidden_size=hidden_size, num_attention_heads=num_heads
-        )
+        self.qkv = nn.Linear(hidden_size, 3 * hidden_size, bias=False)
+        self.q_norm = nn.RMSNorm(self.head_dim)
+        self.k_norm = nn.RMSNorm(self.head_dim)
+        self.proj = nn.Linear(hidden_size, hidden_size)
+        self.rope = RotaryEmbedding(self.head_dim)
 
-    def forward(self, hidden_states: torch.Tensor):
-        bsz, q_len, _ = hidden_states.size()
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: (B, L, D)"""
+        B, L, D = x.shape
 
-        query_states: torch.Tensor = self.q_proj(
-            hidden_states
-        )  # (B, L, num_head*head_dim)
-        key_states: torch.Tensor = self.k_proj(
-            hidden_states
-        )  # (B, L, num_head*head_dim)
-        value_states: torch.Tensor = self.v_proj(
-            hidden_states
-        )  # (B, L, num_head*head_dim)
+        qkv = self.qkv(x).view(B, L, 3, self.num_heads, self.head_dim)
+        q, k, v = qkv.permute(2, 0, 3, 1, 4)  # each (B, H, L, head_dim)
+        q, k = self.q_norm(q.float()).type_as(v), self.k_norm(k.float()).type_as(v)
 
-        query_states = query_states.view(
-            bsz, q_len, self.num_heads, self.head_dim
-        ).transpose(1, 2)  # (bsz, num_heads, q_len, head_dim)
-        key_states = key_states.view(
-            bsz, q_len, self.num_heads, self.head_dim
-        ).transpose(1, 2)  # (bsz, num_heads, q_len, head_dim)
-        value_states = value_states.view(
-            bsz, q_len, self.num_heads, self.head_dim
-        ).transpose(1, 2)  # (bsz, num_heads, q_len, head_dim)
+        cos, sin = self.rope(L, q.dtype)
+        q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
 
-        query_states = self.positional_embedding(
-            query_states
-        )  # (bsz, num_heads, q_len, head_dim)
-        key_states = self.positional_embedding(
-            key_states
-        )  # (bsz, num_heads, q_len, head_dim)
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=self.causal)
+        out = out.transpose(1, 2).reshape(B, L, D)
 
-        scores = torch.matmul(query_states, key_states.transpose(-1, -2)) / (
-            self.head_dim**0.5
-        )
-
-        # causal_mask = torch.triu(
-        #     torch.ones(q_len, q_len, device=hidden_states.device),
-        #     diagonal=1
-        # ).bool()
-
-        # scores = scores.masked_fill(causal_mask, float("-inf"))
-
-        attn_weights = torch.softmax(scores, dim=-1)
-        attn_output = torch.matmul(attn_weights, value_states)
-
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
-        attn_output = self.o_proj(attn_output)
-
-        return attn_output
+        return self.proj(out)
 
 
-class AdaLNZero(nn.Module):
-    def __init__(self, hidden_size, cond_dim):
-        super().__init__()
-
-        self.norm = nn.LayerNorm(hidden_size, elementwise_affine=False)
-
-        self.hidden_size = hidden_size
-        self.mlp = nn.Sequential(nn.SiLU(), nn.Linear(cond_dim, hidden_size * 6))
-
-        nn.init.zeros_(self.mlp[1].weight)
-        nn.init.zeros_(self.mlp[1].bias)
-
-    def forward(self, x, cond):
-        """
-        x: (B, N, D)
-        cond: (B, cond_dim)
-        """
-
-        B, N, D = x.shape
-
-        params = self.mlp(cond)  # (B, 6D)
-        params = params.view(B, 6, N, D)
-
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = params.unbind(
-            1
-        )
-
-        # broadcast
-        # shift_msa = shift_msa.unsqueeze(1)
-        # scale_msa = scale_msa.unsqueeze(1)
-        # gate_msa = gate_msa.unsqueeze(1)
-
-        # shift_mlp = shift_mlp.unsqueeze(1)
-        # scale_mlp = scale_mlp.unsqueeze(1)
-        # gate_mlp = gate_mlp.unsqueeze(1)
-
-        return shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp
+def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    return x * (1 + scale) + shift
 
 
 class DiTBlock(nn.Module):
     """
-    Implementation of DITBlock from https://arxiv.org/pdf/2212.09748
+    DiT block with adaLN-Zero (https://arxiv.org/pdf/2212.09748).
+    The conditioning is per token, so each frame is modulated by its own noise level
+    (needed for Diffusion Forcing).
     """
 
     def __init__(
         self,
         hidden_size: int,
         num_heads: int,
-        conditioning_size: int,
         mlp_ratio: float = 4.0,
+        causal: bool = False,
     ):
         super().__init__()
-        self.norm1 = nn.LayerNorm(
-            hidden_size,
-            elementwise_affine=False,  # Doesn't learn gamme and Beta by itself
-            eps=1.0e-6,
-        )
-        self.attn = ROPEMHAAttention(hidden_size=hidden_size, num_heads=num_heads)
-        self.norm2 = nn.LayerNorm(
-            hidden_size,
-            elementwise_affine=False,  # Doesn't learn gamme and Beta by itself
-            eps=1.0e-6,
-        )
+        self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.attn = RoPEAttention(hidden_size, num_heads, causal=causal)
+        self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
         self.mlp = nn.Sequential(
             nn.Linear(hidden_size, mlp_hidden_dim),
             nn.GELU(approximate="tanh"),
             nn.Linear(mlp_hidden_dim, hidden_size),
         )
-        self.adaLN_modulation = AdaLNZero(hidden_size=hidden_size, cond_dim=conditioning_size)
+
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(), nn.Linear(hidden_size, 6 * hidden_size)
+        )
 
     def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
         """
-        Forward method of the DiTBlock from https://arxiv.org/pdf/2212.09748
-
         Args:
-            x (torch.Tensor): the input tokens (B, N, D)
-            c (torch.Tensor): the conditioning tokens (B, N, D')
-
-        Returns:
-            torch.Tensor: output token
+            x (torch.Tensor): input tokens (B, L, D)
+            c (torch.Tensor): per-token conditioning (B, L, D)
         """
-        gamma1, beta1, alpha1, gamma2, beta2, alpha2 = self.adaLN_modulation(x, c)
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+            self.adaLN_modulation(c).chunk(6, dim=-1)
+        )
 
-        x = x + alpha1 * self.attn(
-            (1 + gamma1) * self.norm1(x) + beta1
-        )
-        x = x + alpha2* self.mlp(
-            (1 + gamma2) * self.norm2(x) + beta2
-        )
+        x = x + gate_msa * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
+        x = x + gate_mlp * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
 
         return x
 
 
-class TimestepEmbedding(nn.Module):
-    def __init__(self, dim: int, mlp_dim: int = 256):
+class FinalLayer(nn.Module):
+    def __init__(self, hidden_size: int, out_dim: int):
         super().__init__()
+        self.norm = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(), nn.Linear(hidden_size, 2 * hidden_size)
+        )
+        self.linear = nn.Linear(hidden_size, out_dim)
 
-        self.dim = dim
+    def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        shift, scale = self.adaLN_modulation(c).chunk(2, dim=-1)
+        return self.linear(modulate(self.norm(x), shift, scale))
 
+
+class TimestepEmbedding(nn.Module):
+    """Sinusoidal embedding of the (per token) diffusion timestep followed by an MLP."""
+
+    def __init__(self, hidden_size: int, frequency_dim: int = 256):
+        super().__init__()
+        self.frequency_dim = frequency_dim
         self.mlp = nn.Sequential(
-            nn.Linear(dim, mlp_dim),
+            nn.Linear(frequency_dim, hidden_size),
             nn.SiLU(),
-            nn.Linear(mlp_dim, dim),
+            nn.Linear(hidden_size, hidden_size),
         )
 
-    def forward(self, t: torch.Tensor):
+    def forward(self, t: torch.Tensor) -> torch.Tensor:
         """
-        t: (B, L)  -> scalar timestep per token
-        return: (B, L, dim)
+        t: (B, L) timestep per token
+        return: (B, L, hidden_size)
         """
-
-        B, L = t.size()
-
-        t_emb = self._sinusoidal_embedding(t, self.dim)  # (B, L, dim)
-        t_emb = self.mlp(t_emb)  # (B, L, dim)
-
-        return t_emb
-
-    def _sinusoidal_embedding(self, t, dim):
-        """
-        t: (B, L)
-        """
-        device = t.device
-
-        half = dim // 2
+        half = self.frequency_dim // 2
         freqs = torch.exp(
-            -torch.log(torch.tensor(10000.0, device=device))
-            * torch.arange(half, device=device)
-            / half
+            -math.log(10_000) * torch.arange(half, device=t.device).float() / half
         )
-
-        args = t.unsqueeze(-1).float() * freqs  # (B, L, dim/2)
-
+        args = t.float().unsqueeze(-1) * freqs  # (B, L, half)
         emb = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
 
-        if dim % 2 == 1:
-            emb = torch.cat([emb, torch.zeros_like(emb[..., :1])], dim=-1)
-
-        return emb
+        return self.mlp(emb)
 
 
 class DiT(nn.Module):
+    """Diffusion Transformer over a sequence of frames, one noise level per frame."""
+
     def __init__(
         self,
-        n_layers: int,
-        hidden_size: int,
-        num_heads: int,
-        conditioning_size: int,
-        mlp_dim: int,
-        mlp_ratio: int,
+        in_dim: int,
+        hidden_size: int = 256,
+        n_layers: int = 6,
+        num_heads: int = 4,
+        mlp_ratio: float = 4.0,
+        causal: bool = False,
     ):
         super().__init__()
 
-        self.t_embedder = TimestepEmbedding(dim=conditioning_size, mlp_dim=mlp_dim)
+        self.input_proj = nn.Linear(in_dim, hidden_size)
+        self.t_embedder = TimestepEmbedding(hidden_size)
 
         self.blocks = nn.ModuleList(
             [
-                DiTBlock(hidden_size, num_heads, conditioning_size, mlp_ratio)
+                DiTBlock(hidden_size, num_heads, mlp_ratio, causal=causal)
                 for _ in range(n_layers)
             ]
         )
+        self.final_layer = FinalLayer(hidden_size, in_dim)
 
-        self.norm = nn.LayerNorm(
-            hidden_size,
-            elementwise_affine=False,  # Doesn't learn gamme and Beta by itself
-            eps=1.0e-6,
-        )
-        self.linear = nn.Linear(hidden_size, hidden_size, bias=True)
+        self._init_weights()
 
-    def forward(self, x, t):
+    def _init_weights(self):
+        def _basic_init(module):
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
+        self.apply(_basic_init)
+
+        nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
+        nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
+
+        # adaLN-Zero: every block starts as the identity, the output starts at 0
+        for block in self.blocks:
+            nn.init.zeros_(block.adaLN_modulation[-1].weight)
+            nn.init.zeros_(block.adaLN_modulation[-1].bias)
+        nn.init.zeros_(self.final_layer.adaLN_modulation[-1].weight)
+        nn.init.zeros_(self.final_layer.adaLN_modulation[-1].bias)
+        nn.init.zeros_(self.final_layer.linear.weight)
+        nn.init.zeros_(self.final_layer.linear.bias)
+
+    def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """
+        x: (B, L, in_dim) noisy frames
+        t: (B, L) timestep per frame
+        return: (B, L, in_dim) prediction of the clean frames (x0)
+        """
+        x = self.input_proj(x)
         c = self.t_embedder(t)
 
         for block in self.blocks:
             x = block(x, c)
 
-        return self.linear(self.norm(x))
+        return self.final_layer(x, c)
 
 
 if __name__ == "__main__":
-    model = DiT(
-        n_layers=8,
-        hidden_size=204,
-        num_heads=6,
-        conditioning_size=256,
-        mlp_dim=256,
-        mlp_ratio=4,
-    )
+    model = DiT(in_dim=136, hidden_size=256, n_layers=6, num_heads=4)
+    print(f"{sum(p.numel() for p in model.parameters()) / 1e6:.2f}M parameters")
 
-    B, L, D = 64, 25, 204
-    T = 1000  # nombre de timesteps
-
-    x = torch.zeros((B, L, D))
-
-    # timestep par token (entiers)
-    t = torch.randint(0, T, (B, L), dtype=torch.long)
-
-    out = model(x, t)
+    B, L, D = 8, 20, 136
+    x = torch.randn(B, L, D)
+    t = torch.randint(0, 1000, (B, L))
+    print(model(x, t).shape)

@@ -1,0 +1,25 @@
+[project]
+name = "dance-dashboard"
+version = "0.1.0"
+description = "Training dashboard: curves + 3D MHR samples"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "mhr",
+    "numpy>=2.0",
+    "pymomentum-cpu==0.1.90.post0",
+    "tensorboard>=2.18",
+    "torch",
+    "trimesh>=4.8.3,<5",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+mhr = { path = "../MHR", editable = true }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true

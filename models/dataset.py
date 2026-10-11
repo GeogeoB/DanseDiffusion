@@ -1,400 +1,168 @@
-import torch
-from torch.utils.data import Dataset
 from pathlib import Path
+
 import numpy as np
-from mhr.mhr import MHR, LOD
-from typing import Optional
-from tqdm import tqdm
-import trimesh
-import pyvista as pv
-import time
-import torch.nn.functional as F
+import torch
 
 
-class LODConverter:
-    """Converts an MHR mesh from one LOD to another using precomputed barycentric mappings."""
+class MotionData:
+    """
+    Sequences of dataset/latent/*.npz (one file per video) kept in memory.
+
+    Only the first `n_features` MHR model parameters are learned (pose / motion); the remaining
+    ones (skeleton scales, nearly constant) are kept aside to rebuild full MHR parameters.
+    """
 
     def __init__(
         self,
-        source_lod: LOD = 1,
-        mapping_dir: Optional[Path] = None,
-        device: torch.device = torch.device("cpu"),
+        folder: str | Path,
+        n_features: int = 136,
+        sequences: list[str] | None = None,
     ):
-        self._source_lod = source_lod
-        self._device = device
-        self._mapping_dir = Path(mapping_dir or Path(__file__).parent)
-        self._models: dict[LOD, MHR] = {}
-        self._mappings: dict[LOD, dict[str, np.ndarray]] = {}
+        paths = sorted(Path(folder).glob("*.npz"))
+        if sequences:
+            paths = [p for p in paths if p.stem in set(sequences)]
+            missing = set(sequences) - {p.stem for p in paths}
+            if missing:
+                raise FileNotFoundError(f"Sequences not found in {folder}: {sorted(missing)}")
+        if not paths:
+            raise FileNotFoundError(f"No .npz sequence in {folder}")
 
-        self._models[source_lod] = MHR.from_files(lod=source_lod, device=device)
+        self.n_features = n_features
+        self.names = []
+        self.motions = []  # (frames, n_features)
+        self.tails = []  # (frames, 204 - n_features)
+        self.shapes = []
+        self.exprs = []
 
-    def _ensure_model(self, target_lod: LOD) -> MHR:
-        if target_lod not in self._models:
-            self._models[target_lod] = MHR.from_files(
-                lod=target_lod, device=self._device
-            )
-        return self._models[target_lod]
+        for path in paths:
+            data = np.load(path)
+            mhr = data["sequence_mhr_model_params_latent"].astype(np.float32)
 
-    def _ensure_mapping(self, target_lod: LOD) -> dict[str, np.ndarray]:
-        if target_lod not in self._mappings:
-            path = (
-                self._mapping_dir
-                / f"lod{self._source_lod}_to_lod{target_lod}_mapping.npz"
-            )
-            self._mappings[target_lod] = dict(np.load(path))
-        return self._mappings[target_lod]
-
-    def convert(self, src_verts: np.ndarray, target_lod: LOD) -> trimesh.Trimesh:
-        """Map vertices from the source LOD onto the target LOD topology.
-
-        Args:
-            src_verts: Source mesh vertices, shape ``(num_source_verts, 3)``.
-            target_lod: The target LOD to convert to.
-        """
-        source = self._models[self._source_lod]
-        expected_n = len(source.character.mesh.vertices)
-
-        if src_verts.ndim != 2 or src_verts.shape[1] != 3:
-            raise ValueError(f"src_verts must have shape (N, 3), got {src_verts.shape}")
-        if src_verts.shape[0] != expected_n:
-            raise ValueError(
-                f"src_verts has {src_verts.shape[0]} vertices, "
-                f"expected {expected_n} for LOD {self._source_lod}"
-            )
-
-        target = self._ensure_model(target_lod)
-        mapping = self._ensure_mapping(target_lod)
-
-        src_faces = source.character.mesh.faces
-        tri_verts = src_verts[src_faces[mapping["triangle_ids"]]]
-        new_verts = np.einsum("ijk,ij->ik", tri_verts, mapping["baryc_coords"])
-
-        return trimesh.Trimesh(new_verts, target.character.mesh.faces, process=False)
-
-
-class MHRSequenceViewer:
-    def __init__(self, fps=30):
-        self.fps = fps
-        self.delay = 1.0 / fps
-
-        # MHR + converter
-        self.mhr_model = MHR.from_files(
-            folder=Path("MHR/assets"), device=torch.device("cpu"), lod=1
-        )
-
-        self.converter = LODConverter(
-            mapping_dir=Path("MHR/tools/mhr_LOD_conversion"), source_lod=1
-        )
-
-        # PyVista viewer
-        self.plotter = pv.Plotter()
-        self.mesh = None
-        self.faces = None
-
-        self.meshes = []
-        self.faces_list = []
-
-    # -------------------------
-    # 🔹 Compute ONE mesh
-    # -------------------------
-    def _compute_mesh(self, shape, mhr, expr):
-        vertices_initial, _ = self.mhr_model(
-            shape.unsqueeze(0),
-            mhr.unsqueeze(0),
-            expr.unsqueeze(0),
-        )
-
-        mesh = self.converter.convert(vertices_initial.squeeze(0), target_lod=2)
-
-        return np.asarray(mesh.vertices), np.asarray(mesh.faces)
-
-    # -------------------------
-    # 🔹 Precompute sequence
-    # -------------------------
-    def precompute(self, sequence_shape, sequence_mhr, sequence_expr):
-        vertices_seq = []
-
-        for shape, mhr, expr in zip(sequence_shape, sequence_mhr, sequence_expr):
-            vertices, faces = self._compute_mesh(shape, mhr, expr)
-
-            if self.faces is None:
-                self.faces = faces  # topology fixe
-
-            vertices_seq.append(vertices)
-
-        return vertices_seq
-
-    # -------------------------
-    # 🔹 Init mesh PyVista
-    # -------------------------
-    def _init_mesh(self, vertices):
-        # PyVista attend un format spécial pour les faces
-        faces_pv = np.hstack(
-            [
-                np.full((self.faces.shape[0], 1), 3),  # triangles
-                self.faces,
-            ]
-        ).astype(np.int32)
-
-        self.mesh = pv.PolyData(vertices, faces_pv)
-        self.plotter.add_mesh(self.mesh)
-
-        self.plotter.show(auto_close=False, interactive_update=True)
-
-    # -------------------------
-    # 🔹 Animation
-    # -------------------------
-    def play(self, vertices_seq, loop=False):
-        while True:
-            for vertices in vertices_seq:
-                if self.mesh is None:
-                    self._init_mesh(vertices)
-                else:
-                    # update vertices ONLY
-                    self.mesh.points = vertices
-                    self.plotter.update()
-
-                time.sleep(self.delay)
-
-            if not loop:
-                break
-
-    # -------------------------
-    # 🔹 Full pipeline
-    # -------------------------
-    def display_sequence(self, sequence_shape, sequence_mhr, sequence_expr, loop=False):
-        vertices_seq = self.precompute(sequence_shape, sequence_mhr, sequence_expr)
-        self.play(vertices_seq, loop=loop)
-
-    # -------------------------
-    def close(self):
-        self.plotter.close()
-
-    def precompute_multiple(self, sequences_shape, sequences_mhr, sequences_expr):
-        all_vertices_seq = []
-
-        for seq_shape, seq_mhr, seq_expr in zip(sequences_shape, sequences_mhr, sequences_expr):
-            vertices_seq = []
-
-            N = 500
-            seq_shape, seq_mhr, seq_expr = interpolate_1d(seq_shape, N), interpolate_1d(seq_mhr, N), interpolate_1d(seq_expr, N)
-
-            for shape, mhr, expr in zip(seq_shape, seq_mhr, seq_expr):
-                vertices, faces = self._compute_mesh(shape, mhr, expr)
-
-                if len(self.faces_list) < len(all_vertices_seq) + 1:
-                    self.faces_list.append(faces)
-
-                vertices_seq.append(vertices)
-
-            all_vertices_seq.append(vertices_seq)
-
-        return all_vertices_seq
-    
-    def _init_meshes(self, vertices_list):
-        spacing = 100.0
-
-        for i, vertices in enumerate(vertices_list):
-            faces = self.faces_list[i]
-
-            offset = np.array([i * spacing, 0, 0])
-            vertices_translated = vertices + offset
-
-            faces_pv = np.hstack([
-                np.full((faces.shape[0], 1), 3),
-                faces,
-            ]).astype(np.int32)
-
-            mesh = pv.PolyData(vertices_translated, faces_pv)
-
-            # Optionnel : couleurs différentes
-            self.plotter.add_mesh(mesh)
-
-            self.meshes.append(mesh)
-
-        self.plotter.show(auto_close=False, interactive_update=True)
-
-    def play_multiple(self, all_vertices_seq, loop=False):
-        spacing = 100.0
-        min_len = min(len(seq) for seq in all_vertices_seq)
-
-        while True:
-            for t in range(min_len):
-                current_vertices = [seq[t] for seq in all_vertices_seq]
-
-                if not self.meshes:
-                    self._init_meshes(current_vertices)
-                else:
-                    for i, (mesh, vertices) in enumerate(zip(self.meshes, current_vertices)):
-                        offset = np.array([i * spacing, 0, 0])
-                        mesh.points = vertices + offset
-
-                    self.plotter.update()
-
-                time.sleep(self.delay)
-
-            if not loop:
-                break
-
-    def display_multiple_sequences(self, sequences_shape, sequences_mhr, sequences_expr, loop=False):
-        all_vertices_seq = self.precompute_multiple(
-            sequences_shape, sequences_mhr, sequences_expr
-        )
-        self.play_multiple(all_vertices_seq, loop=loop)
-
-
-class MHRDataset(Dataset):
-    def __init__(self, folder_path: str):
-        self.folder_path = Path(folder_path)
-        self.files_path = list(self.folder_path.rglob("*.npz"))
+            self.names.append(path.stem)
+            self.motions.append(mhr[:, :n_features])
+            self.tails.append(mhr[:, n_features:])
+            self.shapes.append(data["sequence_shape"].astype(np.float32))
+            self.exprs.append(data["sequence_expr_params"].astype(np.float32))
 
     def __len__(self):
-        return len(self.files_path)
+        return len(self.motions)
 
-    def __getitem__(self, index):
-        file_path = self.files_path[index]
+    @property
+    def n_frames(self):
+        return sum(len(m) for m in self.motions)
 
-        data = np.load(file_path, allow_pickle=True)["arr_0"].item()
-        return data["shape_params"], data["mhr_model_params"], data["expr_params"]
-
-
-class SequenceDataset(Dataset):
-    def __init__(self, sequence_folder: str, sequence_size=10):
-        self.sequence_folder = Path(sequence_folder)
-        self.sequence_files = sorted(self.sequence_folder.glob("*.npz"))
-        self.sequence_size = sequence_size
-
-        self.file_lengths = []
-        self.n_sequence = 0
-
-        for file in self.sequence_files:
-            data = np.load(file, allow_pickle=True)
-            length = (
-                data["sequence_mhr_model_params_latent"].shape[0] - self.sequence_size
-            )
-            length = max(0, length)
-            self.file_lengths.append(length)
-            self.n_sequence += length
-
-    def __len__(self):
-        return self.n_sequence
-
-    def __getitem__(self, index):
-        # Trouver le bon fichier
-        for file, length in zip(self.sequence_files, self.file_lengths):
-            if index < length:
-                data = np.load(file, allow_pickle=True)
-
-                start = index
-                end = start + self.sequence_size
-
-                sequence_shape = data["sequence_shape"][start:end]
-                sequence_mhr = data["sequence_mhr_model_params_latent"][start:end]
-                sequence_expr = data["sequence_expr_params"][start:end]
-
-                return {
-                    "shape": sequence_shape,
-                    "mhr": sequence_mhr,
-                    "expr": sequence_expr,
-                }
-            else:
-                index -= length
-
-        raise IndexError("Index out of range")
-
-
-def interpolate_1d(x, M):
-    """
-    x: [N, d]
-    return: [M, d]
-    """
-    N, d = x.shape
-
-    # reshape pour interpolation 1D: [batch=1, channels=d, length=N]
-    x = x.T.unsqueeze(0)  # [1, d, N]
-
-    x_interp = F.interpolate(x, size=M, mode="linear", align_corners=True)
-
-    return x_interp.squeeze(0).T  # [M, d]
-
-class ToyDataset(torch.utils.data.Dataset):
-    def __init__(self, n_samples=1000, seq_len=100, dim=136):
-        self.data = torch.randn(n_samples, seq_len, dim) * 0.01
-
-        # structure simple (sinusoïde → pattern apprenable)
-        t = torch.linspace(0, 2 * torch.pi, seq_len)
-        pattern = torch.sin(t)[None, :, None]
-
-        self.data += pattern
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, idx):
+    def reference(self, index: int = 0) -> dict[str, np.ndarray]:
+        """Per-frame constant parameters (one frame) used to turn generated motion into MHR."""
         return {
-            "mhr": self.data[idx]
+            "tail": self.tails[index].mean(0),
+            "shape": self.shapes[index][0],
+            "expr": self.exprs[index][0],
         }
 
-if __name__ == "__main__":
-    dataset = MHRDataset("dataset/data")
-    dataset = SequenceDataset("dataset/latent", sequence_size=25)
 
-    data = next(iter(dataset))
+class Normalizer:
+    """Per-feature standardization. Constant features get std = 1 (they stay at 0)."""
 
-    shape, mhr, expr = data
+    def __init__(self, mean: torch.Tensor, std: torch.Tensor):
+        self.mean = mean
+        self.std = std
 
-    viewer = MHRSequenceViewer(fps=40)
+    @classmethod
+    def fit(cls, motions: list[np.ndarray], min_std: float = 1e-5):
+        data = torch.from_numpy(np.concatenate(motions, axis=0)).double()
+        mean = data.mean(0)
+        std = data.std(0)
+        std = torch.where(std < min_std, torch.ones_like(std), std)
+        return cls(mean.float(), std.float())
 
-    i = 0
-    for sequence in iter(dataset):
-        i += 1
-        if i < 510:
-            continue
+    def to(self, device):
+        return Normalizer(self.mean.to(device), self.std.to(device))
 
-        shape = torch.from_numpy(sequence["shape"])
-        mhr = torch.from_numpy(sequence["mhr"])
-        expr = torch.from_numpy(sequence["expr"])
-        
-        print(f"{mhr.size() = }")
+    def normalize(self, x: torch.Tensor) -> torch.Tensor:
+        return (x - self.mean.to(x.device)) / self.std.to(x.device)
 
-        cols_zero = (mhr == 0).all(dim=0)
-        print(torch.where(cols_zero)[0])
-        input()
+    def denormalize(self, x: torch.Tensor) -> torch.Tensor:
+        return x * self.std.to(x.device) + self.mean.to(x.device)
 
-        # viewer.display_sequence(
-        #     interpolate_1d(shape, 100), interpolate_1d(mhr, 100), interpolate_1d(expr, 100), loop=True
-        # )
+    def state_dict(self):
+        return {"mean": self.mean.cpu(), "std": self.std.cpu()}
 
-    viewer.close()
+    @classmethod
+    def from_state_dict(cls, state):
+        return cls(state["mean"], state["std"])
 
-    # Compute std and mean
 
-    # def compute_mean_std(dataset):
-    #     n = 0
-    #     mean = None
-    #     m2 = None  # pour variance (Welford)
+class WindowSampler:
+    """
+    All windows of `window` consecutive frames, sampled directly on the GPU.
+    Sequences are concatenated; windows never cross a sequence boundary.
+    """
 
-    #     for data in tqdm(dataset):
-    #         _, mhr, _ = data
+    def __init__(
+        self,
+        motions: list[np.ndarray],
+        normalizer: Normalizer,
+        window: int,
+        device,
+        stride: int = 1,
+        groups: list[str] | None = None,
+        balance_power: float = 1.0,
+    ):
+        """
+        groups / balance_power: windows of a group (e.g. a data source) are sampled with total
+        probability proportional to (group size) ** balance_power (1 = uniform over windows,
+        0.5 = sqrt balancing, 0 = every group equally likely).
+        """
+        self.window = window
+        self.device = device
 
-    #         mhr = torch.from_numpy(mhr).float()  # (L, D) ou (D,)
+        data, starts, window_groups, offset = [], [], [], 0
+        for i, motion in enumerate(motions):
+            n = len(motion)
+            if n >= window:
+                new = range(offset, offset + n - window + 1, stride)
+                starts.extend(new)
+                window_groups.extend([groups[i] if groups else ""] * len(new))
+            data.append(torch.from_numpy(motion))
+            offset += n
 
-    #         # aplatir si besoin (optionnel selon ton format)
-    #         mhr = mhr.reshape(-1)
+        if not starts:
+            raise ValueError(f"No sequence is long enough for a window of {window} frames")
 
-    #         if mean is None:
-    #             mean = torch.zeros_like(mhr)
-    #             m2 = torch.zeros_like(mhr)
+        self.data = normalizer.normalize(torch.cat(data).to(device))
+        self.starts = torch.tensor(starts, device=device)
+        self._offsets = torch.arange(window, device=device)
 
-    #         n += 1
-    #         delta = mhr - mean
-    #         mean += delta / n
-    #         delta2 = mhr - mean
-    #         m2 += delta * delta2
+        self.weights = None
+        if groups and balance_power != 1.0:
+            counts: dict[str, int] = {}
+            for g in window_groups:
+                counts[g] = counts.get(g, 0) + 1
+            w = [counts[g] ** (balance_power - 1.0) for g in window_groups]
+            self.weights = torch.tensor(w, device=device, dtype=torch.float)
 
-    #     std = torch.sqrt(m2 / (n - 1 + 1e-8))
+    def __len__(self):
+        return len(self.starts)
 
-    #     return mean, std
+    def _gather(self, starts: torch.Tensor) -> torch.Tensor:
+        return self.data[starts[:, None] + self._offsets]  # (B, window, D)
 
-    # dataset = MHRDataset("dataset/data")
-    # print(compute_mean_std(dataset))
+    def sample(self, batch_size: int, generator: torch.Generator | None = None):
+        if self.weights is not None:
+            idx = torch.multinomial(self.weights, batch_size, replacement=True, generator=generator)
+        else:
+            idx = torch.randint(
+                len(self.starts), (batch_size,), device=self.device, generator=generator
+            )
+        return self._gather(self.starts[idx])
+
+    def all_windows(self) -> torch.Tensor:
+        return self._gather(self.starts)
+
+    def subset(self, n: int, seed: int = 0) -> torch.Tensor:
+        """Fixed random subset of at most n windows (uniform, for evaluation)."""
+        if len(self.starts) <= n:
+            return self.all_windows()
+        g = torch.Generator(device="cpu").manual_seed(seed)
+        idx = torch.randperm(len(self.starts), generator=g)[:n].to(self.device)
+        return self._gather(self.starts[idx])
